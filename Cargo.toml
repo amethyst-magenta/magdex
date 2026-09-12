@@ -1,0 +1,30 @@
+[package]
+name = "magdex"
+version = "0.1.0"
+edition = "2021"
+description = "Magdex, a minimal terminal frontend for the official Codex app-server"
+license = "MIT"
+
+[[bin]]
+name = "magdex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+base64 = "0.22"
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "6.0"
+futures-util = "0.3"
+ratatui = "0.29"
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["fs", "macros", "process", "rt-multi-thread", "io-util", "sync", "time"] }
+toml = "0.8"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
