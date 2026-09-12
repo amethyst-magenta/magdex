@@ -1,1 +1,6 @@
+AGENTS.md
+STATE.md
+DAILY.md
 .codex/
+/target/
+*.log
