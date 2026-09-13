@@ -36,13 +36,12 @@ magdex resume
 | `Alt+Enter` | Insert a newline |
 | `Ctrl+V` | Paste text or attach an image from the system clipboard |
 | `Ctrl+C` | Interrupt; clear input; quit when idle and empty |
-| `Ctrl+P` | Command palette |
-| `Ctrl+R` | Resume a thread |
-| `PageUp` / `PageDown` | Scroll transcript |
-| `Home` / `End` | Top / follow newest output |
+| `Ctrl+P` / `Ctrl+N` | Recall older/newer messages in the composer |
+| `↑` / `↓` | Move between composer lines |
+| `Ctrl+K` / `Ctrl+J` | Smoothly scroll transcript up/down |
+| `Ctrl+G` | Jump to the latest output |
 | Mouse wheel | Scroll transcript |
-| `Ctrl+O` | Expand the latest long command output |
-| `↑` / `↓` | Recall older/newer messages in the composer |
+| `Ctrl+O` | Expand the current command output |
 | `Esc` | Close the bottom panel (or cancel an approval) |
 | `↑` / `↓` or `j` / `k` | Choose an answer when Codex asks a structured question |
 
@@ -50,8 +49,13 @@ Press `Ctrl+V` to attach an image from the system clipboard. Repeat to attach
 multiple images; an image-only turn is also supported. If the clipboard holds
 text, `Ctrl+V` inserts that text normally.
 
-The other textual commands are `/new`, `/resume`, `/mode`, `/model`,
-`/reasoning`, `/login`, and `/quit`.
+The textual commands are `/new`, `/resume`, `/mode`, `/model`, `/reasoning`,
+`/history`, and `/bottom`. `/history` lists your messages in the current thread;
+selecting one jumps to it in the transcript.
+Typing `/` in the composer shows and filters the available commands.
+`/new` switches to a new thread without deleting the current one; `/resume`
+switches to a stored thread. Authentication is checked on startup and required
+automatically when no Codex account is available.
 
 Frontend-only settings may be placed in `~/.config/magdex/config.toml`:
 
