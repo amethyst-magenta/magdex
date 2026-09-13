@@ -183,6 +183,18 @@ impl Controller {
                     self.state.turn_id = None;
                     self.state.turn_started_at = None;
                 }
+                Pending::Account => {
+                    self.state.popup = Some(Popup::Login {
+                        url: None,
+                        error: Some(format!("Could not check Codex account: {detail}")),
+                    });
+                }
+                Pending::Login => {
+                    self.state.popup = Some(Popup::Login {
+                        url: None,
+                        error: Some(detail),
+                    });
+                }
                 _ => {}
             }
             return Ok(());
@@ -241,6 +253,10 @@ impl Controller {
         self.rpc.notify("initialized", json!({}))?;
         let account = self.rpc.request("account/read", json!({}))?;
         self.pending.insert(account, Pending::Account);
+        Ok(())
+    }
+
+    fn after_authentication(&mut self) -> Result<()> {
         let models = self
             .rpc
             .request("model/list", json!({"includeHidden": false}))?;
@@ -276,21 +292,10 @@ impl Controller {
     }
 
     fn apply_account(&mut self, result: &Value) -> Result<()> {
-        if result
-            .get("account")
-            .is_some_and(|account| !account.is_null())
-            || !result
-                .get("requiresOpenaiAuth")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-        {
-            return Ok(());
+        if account_is_available(result) {
+            return self.after_authentication();
         }
-        self.state.popup = Some(Popup::Login {
-            url: None,
-            error: None,
-        });
-        Ok(())
+        self.begin_login()
     }
 
     fn begin_login(&mut self) -> Result<()> {
@@ -1509,6 +1514,7 @@ impl Controller {
                         "Account",
                         "Signed in with ChatGPT.",
                     ));
+                    self.after_authentication()?;
                 } else {
                     self.state.popup = Some(Popup::Login {
                         url: None,
@@ -2162,6 +2168,16 @@ fn open_browser(url: &str) {
         .spawn();
 }
 
+fn account_is_available(result: &Value) -> bool {
+    result
+        .get("account")
+        .is_some_and(|account| !account.is_null())
+        || !result
+            .get("requiresOpenaiAuth")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+}
+
 pub fn palette_items() -> &'static [&'static str] {
     &PALETTE
 }
@@ -2187,6 +2203,19 @@ mod tests {
     #[test]
     fn unknown_items_are_ignored() {
         assert!(block_from_item(&json!({"id":"1", "type":"futureThing"}), true, true).is_none());
+    }
+
+    #[test]
+    fn account_gate_requires_login_only_when_codex_requires_it() {
+        assert!(account_is_available(
+            &json!({"account": {"type": "chatgpt"}})
+        ));
+        assert!(account_is_available(
+            &json!({"account": null, "requiresOpenaiAuth": false})
+        ));
+        assert!(!account_is_available(
+            &json!({"account": null, "requiresOpenaiAuth": true})
+        ));
     }
 
     #[test]
