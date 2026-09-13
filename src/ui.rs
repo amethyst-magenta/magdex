@@ -9,10 +9,11 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{format_duration, palette_items, relative_time},
+    app::{format_duration, relative_time, SLASH_COMMANDS},
     model::{
-        AppState, ApprovalKind, BlockKind, ImageAttachment, Popup, TranscriptBlock,
-        UserInputRequest,
+        layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind, CommandAction,
+        CommandActionKind, ComposerLayout, FileChange, FileChangeKind, ImageAttachment, Popup,
+        TranscriptBlock, UserInputRequest,
     },
 };
 
@@ -20,6 +21,8 @@ const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
 const USER_BACKGROUND: Color = Color::Rgb(48, 48, 48);
 const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 38, 38);
+const DIFF_ADD_BACKGROUND: Color = Color::Rgb(28, 65, 46);
+const DIFF_REMOVE_BACKGROUND: Color = Color::Rgb(78, 37, 34);
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     if state.resume_picker.is_some() {
@@ -29,26 +32,29 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
     // The composer has two cells of horizontal padding on each side and a
     // two-cell prompt (`› `), so wrap against its real text width.
+    state.composer_width = area.width.saturating_sub(6).max(1) as usize;
     let composer = layout_composer(
         &state.composer.text,
         state.composer.cursor,
-        area.width.saturating_sub(6).max(1) as usize,
+        state.composer_width,
     );
     let composer_lines = composer.lines.len().clamp(1, 8) as u16;
     let attachment_rows = attachment_row_count(state.image_attachments.len());
-    let composer_height =
-        (composer_lines + attachment_rows + 4).min(area.height.saturating_sub(4).max(5));
+    let slash_suggestions = slash_command_suggestions(&state.composer.text);
+    let suggestion_rows = slash_suggestions.len() as u16;
+    let composer_height = (composer_lines + attachment_rows + suggestion_rows + 4)
+        .min(area.height.saturating_sub(4).max(5));
     let panel_gap = u16::from(state.popup.is_some() && area.height > 4);
     let bottom_height = state
         .popup
         .as_ref()
         .map(|popup| bottom_panel_height(state, popup, area.width))
         .unwrap_or(composer_height)
-        .min(area.height.saturating_sub(3 + panel_gap).max(1));
+        .min(area.height.saturating_sub(5 + panel_gap).max(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(panel_gap),
             Constraint::Length(bottom_height),
@@ -60,7 +66,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     if let Some(popup) = &state.popup {
         draw_bottom_panel(frame, state, popup.clone(), chunks[3]);
     } else {
-        draw_composer(frame, state, &composer, chunks[3]);
+        draw_composer(frame, state, &composer, &slash_suggestions, chunks[3]);
     }
 }
 
@@ -72,11 +78,11 @@ fn draw_resume_workspace(frame: &mut Frame, state: &AppState) {
         .as_ref()
         .map(|popup| bottom_panel_height(state, popup, area.width))
         .unwrap_or(0)
-        .min(area.height.saturating_sub(3 + panel_gap));
+        .min(area.height.saturating_sub(5 + panel_gap));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(panel_gap),
             Constraint::Length(panel_height),
@@ -161,11 +167,6 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
         &state.collaboration_mode,
     ]
     .join(" · ");
-    let right = if let Some(percent) = state.context_percent {
-        format!("{right} · {percent}%")
-    } else {
-        right
-    };
     let width = area.width.saturating_sub(2) as usize;
     let left_width = state.project.width();
     let right_width = right.width();
@@ -175,9 +176,10 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
         Span::raw(" ".repeat(gap)),
         Span::styled(right, Style::default().fg(DIM)),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
-    let separator = "─".repeat(area.width as usize);
-    let sep_area = Rect::new(area.x, area.y + 1, area.width, 1);
+    let text_area = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+    frame.render_widget(Paragraph::new(line), text_area);
+    let separator = "▔".repeat(area.width as usize);
+    let sep_area = Rect::new(area.x, area.y.saturating_add(3), area.width, 1);
     frame.render_widget(
         Paragraph::new(separator).style(Style::default().fg(DIM)),
         sep_area,
@@ -194,7 +196,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
     }
     if state.new_output {
         tail.push(Line::from(Span::styled(
-            "  ↓ new output · End to follow",
+            "  ↓ new output · Ctrl+G to latest",
             Style::default().fg(ACCENT),
         )));
     }
@@ -245,8 +247,15 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
     let content_width = width.saturating_sub(4).max(1);
     let render_width = width.max(1);
     let mut lines = Vec::new();
+    let mut block_offsets = vec![None; state.blocks.len()];
     let mut in_activity = false;
-    for block in &state.blocks {
+    let current_action = state.blocks.iter().rposition(|block| {
+        matches!(
+            block.kind,
+            BlockKind::Command | BlockKind::File | BlockKind::Web
+        )
+    });
+    for (index, block) in state.blocks.iter().enumerate() {
         if matches!(
             block.kind,
             BlockKind::Reasoning | BlockKind::Assistant | BlockKind::Commentary
@@ -272,11 +281,14 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
             lines.push(Line::default());
             in_activity = false;
         }
+        block_offsets[index] = Some(lines.len());
         append_block(
             &mut lines,
             block,
             content_width as usize,
             render_width as usize,
+            &state.cwd,
+            current_action == Some(index) && block.kind == BlockKind::Command,
         );
     }
     if in_activity {
@@ -286,6 +298,7 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
     state.transcript_cache_width = width;
     state.transcript_cache_revision = state.transcript_revision;
     state.transcript_cache_lines = lines;
+    state.transcript_block_offsets = block_offsets;
 }
 
 fn append_block(
@@ -293,6 +306,8 @@ fn append_block(
     block: &TranscriptBlock,
     width: usize,
     render_width: usize,
+    cwd: &str,
+    can_expand: bool,
 ) {
     match block.kind {
         BlockKind::User => {
@@ -324,34 +339,9 @@ fn append_block(
                 );
             }
         }
-        BlockKind::Command => append_command(lines, block, width),
-        BlockKind::File => {
-            lines.push(Line::from(Span::styled(
-                "  Files",
-                Style::default().fg(Color::Magenta).bold(),
-            )));
-            for line in block.text.lines() {
-                let style = match line.chars().next() {
-                    Some('+') => Style::default().fg(Color::Green),
-                    Some('-') => Style::default().fg(Color::Red),
-                    _ => Style::default().fg(Color::Magenta),
-                };
-                push_wrapped_line(
-                    lines,
-                    vec![Span::styled(format!("    {line}"), style)],
-                    width,
-                );
-            }
-        }
-        BlockKind::Web => {
-            lines.push(Line::from(Span::styled(
-                "  Web search",
-                Style::default().fg(Color::Blue).bold(),
-            )));
-            for line in block.text.lines() {
-                push_wrapped_line(lines, vec![Span::raw(format!("    {line}"))], width);
-            }
-        }
+        BlockKind::Command => append_command(lines, block, width, can_expand),
+        BlockKind::File => append_file_changes(lines, block, width, render_width, cwd),
+        BlockKind::Web => append_web_action(lines, block, width),
         BlockKind::Error => {
             lines.push(Line::from(Span::styled(
                 "  Error",
@@ -434,48 +424,461 @@ fn working_indicator(started: std::time::Instant) -> Line<'static> {
     Line::from(spans)
 }
 
-fn append_command(lines: &mut Vec<Line<'static>>, block: &TranscriptBlock, width: usize) {
-    let color = Color::Yellow;
+fn append_command(
+    lines: &mut Vec<Line<'static>>,
+    block: &TranscriptBlock,
+    width: usize,
+    can_expand: bool,
+) {
     let command = block.title.strip_prefix("$ ").unwrap_or(&block.title);
-    let mut output = block.text.lines();
-    let status = output.next().unwrap_or("running…");
-    let output = output.collect::<Vec<_>>();
-    lines.push(Line::from(Span::styled(
-        "  Shell",
-        Style::default().fg(color).bold(),
-    )));
-    push_wrapped_line(
-        lines,
-        vec![
-            Span::styled("    $ ", Style::default().fg(color)),
-            Span::styled(command.to_string(), Style::default().fg(color)),
-        ],
-        width,
-    );
-    if !block.expanded && output.len() > 12 {
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                format!("{} lines · {status} · Ctrl+O to expand", output.len()),
-                Style::default().fg(DIM),
-            ),
-        ]));
-        return;
+    let status = block.action_status.unwrap_or(ActionStatus::InProgress);
+    let explored = !block.command_actions.is_empty()
+        && block
+            .command_actions
+            .iter()
+            .all(|action| action.kind != CommandActionKind::Unknown);
+    let heading = match (explored, status) {
+        (true, ActionStatus::InProgress) => "Exploring",
+        (true, _) => "Explored",
+        (false, ActionStatus::InProgress) => "Running",
+        (false, ActionStatus::Declined) => "Declined",
+        (false, _) => "Ran",
+    };
+    if explored {
+        lines.push(Line::from(Span::styled(
+            format!("  {heading}"),
+            Style::default().bold(),
+        )));
+        let last = block.command_actions.len().saturating_sub(1);
+        for (index, action) in block.command_actions.iter().enumerate() {
+            append_command_action(lines, action, index == last, width);
+        }
+    } else {
+        let mut spans = vec![Span::styled(
+            format!("  {heading} "),
+            Style::default().bold(),
+        )];
+        spans.extend(shell_command_spans(command));
+        push_wrapped_line(lines, spans, width);
     }
-    for line in output {
+
+    let failed = status == ActionStatus::Failed || block.exit_code.is_some_and(|code| code != 0);
+    let expanded = can_expand && block.expanded;
+    if (!explored || expanded || failed) && !block.text.is_empty() {
+        let mut output_rows = Vec::new();
+        for (index, line) in block.text.lines().enumerate() {
+            let prefix = if index == 0 { "    └ " } else { "      " };
+            push_wrapped_line(
+                &mut output_rows,
+                vec![Span::styled(
+                    format!("{prefix}{line}"),
+                    Style::default().fg(DIM),
+                )],
+                width,
+            );
+        }
+        append_collapsible_rows(lines, output_rows, expanded, 6, can_expand);
+    }
+
+    if failed {
+        let message = block
+            .exit_code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_else(|| "command failed".to_string());
         push_wrapped_line(
             lines,
             vec![Span::styled(
-                format!("    {line}"),
-                Style::default().fg(Color::Gray),
+                format!("    {message}"),
+                Style::default().fg(Color::Red),
             )],
             width,
         );
+    } else if status == ActionStatus::Declined {
+        lines.push(Line::from(Span::styled(
+            "    declined",
+            Style::default().fg(Color::Red),
+        )));
     }
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(status.to_string(), Style::default().fg(DIM)),
-    ]));
+}
+
+fn append_command_action(
+    lines: &mut Vec<Line<'static>>,
+    action: &CommandAction,
+    last: bool,
+    width: usize,
+) {
+    let branch = if last { "    └ " } else { "    ├ " };
+    let mut spans = vec![Span::styled(branch, Style::default().fg(DIM))];
+    let verb = match action.kind {
+        CommandActionKind::Read => Some("Read"),
+        CommandActionKind::ListFiles => Some("List"),
+        CommandActionKind::Search => Some("Search"),
+        CommandActionKind::Unknown => None,
+    };
+    if let Some(verb) = verb {
+        spans.push(Span::styled(verb.to_string(), Style::default().fg(ACCENT)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            action.label.clone(),
+            Style::default().fg(Color::Gray),
+        ));
+    } else {
+        spans.extend(shell_command_spans(&action.label));
+    }
+    push_wrapped_line(lines, spans, width);
+}
+
+fn shell_command_spans(command: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut next_is_program = true;
+    for (index, token) in command.split_whitespace().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let operator = matches!(token, "|" | "||" | "&&" | ";");
+        let style = if operator {
+            Style::default().fg(Color::Yellow)
+        } else if next_is_program {
+            Style::default().fg(ACCENT)
+        } else if token.starts_with('-') {
+            Style::default().fg(DIM)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(token.to_string(), style));
+        next_is_program = operator;
+    }
+    spans
+}
+
+fn append_collapsible_rows(
+    lines: &mut Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    expanded: bool,
+    collapsed_rows: usize,
+    show_shortcut: bool,
+) {
+    let hidden = rows.len().saturating_sub(collapsed_rows);
+    if expanded || hidden == 0 {
+        lines.extend(rows);
+        return;
+    }
+    lines.extend(rows.into_iter().take(collapsed_rows));
+    let summary = if show_shortcut {
+        format!("    … +{hidden} lines · Ctrl+O to expand")
+    } else {
+        format!("    … +{hidden} lines")
+    };
+    lines.push(Line::from(Span::styled(summary, Style::default().fg(DIM))));
+}
+
+fn append_file_changes(
+    lines: &mut Vec<Line<'static>>,
+    block: &TranscriptBlock,
+    width: usize,
+    render_width: usize,
+    cwd: &str,
+) {
+    if block.file_changes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Changed files",
+            Style::default().bold(),
+        )));
+        return;
+    }
+
+    for change in &block.file_changes {
+        let status = block.action_status.unwrap_or(ActionStatus::Completed);
+        let verb = file_change_verb(change, status);
+        let path = display_action_path(&change.path, cwd);
+        let mut heading = vec![
+            Span::styled(format!("  {verb} "), Style::default().bold()),
+            Span::styled(path, Style::default().fg(ACCENT)),
+        ];
+        if let Some(move_path) = &change.move_path {
+            heading.push(Span::styled(" → ", Style::default().fg(DIM)));
+            heading.push(Span::styled(
+                display_action_path(move_path, cwd),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        let (added, removed) = diff_stats(&change.diff);
+        if added > 0 || removed > 0 {
+            heading.push(Span::styled(" (", Style::default().fg(DIM)));
+        }
+        if added > 0 {
+            heading.push(Span::styled(
+                format!("+{added}"),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if added > 0 && removed > 0 {
+            heading.push(Span::raw(" "));
+        }
+        if removed > 0 {
+            heading.push(Span::styled(
+                format!("-{removed}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if added > 0 || removed > 0 {
+            heading.push(Span::styled(")", Style::default().fg(DIM)));
+        }
+        push_wrapped_line(lines, heading, width);
+
+        if !change.diff.is_empty() {
+            append_diff(lines, &change.diff, render_width);
+        }
+    }
+
+    match block.action_status {
+        Some(ActionStatus::Failed) => lines.push(Line::from(Span::styled(
+            "    file change failed",
+            Style::default().fg(Color::Red),
+        ))),
+        Some(ActionStatus::Declined) => lines.push(Line::from(Span::styled(
+            "    file change declined",
+            Style::default().fg(Color::Red),
+        ))),
+        _ => {}
+    }
+}
+
+fn file_change_verb(change: &FileChange, status: ActionStatus) -> &'static str {
+    match (status, change.kind, change.move_path.is_some()) {
+        (ActionStatus::InProgress, FileChangeKind::Add, _) => "Adding",
+        (ActionStatus::InProgress, FileChangeKind::Delete, _) => "Deleting",
+        (ActionStatus::InProgress, _, true) => "Moving",
+        (ActionStatus::InProgress, FileChangeKind::Update, _) => "Editing",
+        (ActionStatus::InProgress, FileChangeKind::Unknown, _) => "Changing",
+        (_, FileChangeKind::Add, _) => "Added",
+        (_, FileChangeKind::Delete, _) => "Deleted",
+        (_, _, true) => "Moved",
+        (_, FileChangeKind::Update, _) => "Edited",
+        (_, FileChangeKind::Unknown, _) => "Changed",
+    }
+}
+
+fn display_action_path(path: &str, cwd: &str) -> String {
+    let path_value = std::path::Path::new(path);
+    if let Ok(relative) = path_value.strip_prefix(cwd) {
+        if !relative.as_os_str().is_empty() {
+            return relative.to_string_lossy().into_owned();
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Some(suffix) = path
+            .strip_prefix(&home)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+        {
+            return format!("~/{suffix}");
+        }
+    }
+    path.to_string()
+}
+
+fn diff_stats(diff: &str) -> (usize, usize) {
+    let added = diff
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let removed = diff
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    (added, removed)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffRowKind {
+    Context,
+    Added,
+    Removed,
+    Metadata,
+}
+
+struct DiffRow<'a> {
+    line_number: Option<usize>,
+    kind: DiffRowKind,
+    content: &'a str,
+}
+
+fn append_diff(lines: &mut Vec<Line<'static>>, diff: &str, width: usize) {
+    let rows = parse_diff_rows(diff);
+    let gutter_width = rows
+        .iter()
+        .filter_map(|row| row.line_number)
+        .map(|line| line.to_string().len())
+        .max()
+        .unwrap_or(1);
+
+    for row in rows {
+        append_diff_row(lines, row, gutter_width, width);
+    }
+}
+
+fn parse_diff_rows(diff: &str) -> Vec<DiffRow<'_>> {
+    let mut rows = Vec::new();
+    let mut old_line = None;
+    let mut new_line = None;
+
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            if let Some((old, new)) = parse_hunk_positions(line) {
+                old_line = Some(old);
+                new_line = Some(new);
+            }
+            continue;
+        }
+        if line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+        {
+            continue;
+        }
+
+        let (kind, content, line_number) = if let Some(content) = line.strip_prefix('+') {
+            let number = new_line;
+            new_line = new_line.map(|line| line.saturating_add(1));
+            (DiffRowKind::Added, content, number)
+        } else if let Some(content) = line.strip_prefix('-') {
+            let number = old_line;
+            old_line = old_line.map(|line| line.saturating_add(1));
+            (DiffRowKind::Removed, content, number)
+        } else if let Some(content) = line.strip_prefix(' ') {
+            let number = new_line.or(old_line);
+            old_line = old_line.map(|line| line.saturating_add(1));
+            new_line = new_line.map(|line| line.saturating_add(1));
+            (DiffRowKind::Context, content, number)
+        } else {
+            (DiffRowKind::Metadata, line, None)
+        };
+        rows.push(DiffRow {
+            line_number,
+            kind,
+            content,
+        });
+    }
+
+    rows
+}
+
+fn parse_hunk_positions(header: &str) -> Option<(usize, usize)> {
+    let mut fields = header.split_whitespace();
+    (fields.next()? == "@@").then_some(())?;
+    let old = parse_hunk_position(fields.next()?, '-')?;
+    let new = parse_hunk_position(fields.next()?, '+')?;
+    Some((old, new))
+}
+
+fn parse_hunk_position(field: &str, prefix: char) -> Option<usize> {
+    field.strip_prefix(prefix)?.split(',').next()?.parse().ok()
+}
+
+fn append_diff_row(
+    lines: &mut Vec<Line<'static>>,
+    row: DiffRow<'_>,
+    gutter_width: usize,
+    width: usize,
+) {
+    let marker = match row.kind {
+        DiffRowKind::Added => '+',
+        DiffRowKind::Removed => '-',
+        DiffRowKind::Context | DiffRowKind::Metadata => ' ',
+    };
+    let marker_style = match row.kind {
+        DiffRowKind::Added => Style::default().fg(Color::Green),
+        DiffRowKind::Removed => Style::default().fg(Color::Red),
+        DiffRowKind::Context | DiffRowKind::Metadata => Style::default().fg(DIM),
+    };
+    let content_style = match row.kind {
+        DiffRowKind::Added | DiffRowKind::Removed => {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+        }
+        DiffRowKind::Context | DiffRowKind::Metadata => Style::default().fg(DIM),
+    };
+    let background = match row.kind {
+        DiffRowKind::Added => Some(DIFF_ADD_BACKGROUND),
+        DiffRowKind::Removed => Some(DIFF_REMOVE_BACKGROUND),
+        DiffRowKind::Context | DiffRowKind::Metadata => None,
+    };
+    let prefix_width = gutter_width.saturating_add(5);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let wrapped = hard_wrap_preserving(row.content, content_width);
+
+    for (index, content) in wrapped.into_iter().enumerate() {
+        let number = if index == 0 {
+            row.line_number
+                .map(|line| line.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let row_start = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {number:>gutter_width$} "),
+                Style::default().fg(DIM),
+            ),
+            Span::styled(
+                if index == 0 { marker } else { ' ' }.to_string(),
+                marker_style,
+            ),
+            Span::raw(" "),
+            Span::styled(content, content_style),
+        ]));
+        if let Some(background) = background {
+            apply_background_band(&mut lines[row_start..], width, background);
+        }
+    }
+}
+
+fn hard_wrap_preserving(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used: usize = 0;
+    for ch in text.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if !row.is_empty() && used.saturating_add(char_width) > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(ch);
+        used = used.saturating_add(char_width);
+        if used >= width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn append_web_action(lines: &mut Vec<Line<'static>>, block: &TranscriptBlock, width: usize) {
+    for (index, detail) in block.text.lines().enumerate() {
+        let mut spans = vec![Span::raw("  ")];
+        if index == 0 {
+            spans.push(Span::styled(
+                format!("{} ", block.title),
+                Style::default().bold(),
+            ));
+        }
+        spans.push(Span::styled(
+            detail.to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+        push_wrapped_line(lines, spans, width);
+    }
 }
 
 fn append_markdown(
@@ -699,88 +1102,24 @@ fn inline_spans(input: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ComposerLayout {
-    lines: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
+fn slash_command_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return vec![];
+    }
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(command, _)| command.starts_with(input))
+        .collect()
 }
 
-fn layout_composer(text: &str, cursor: usize, width: usize) -> ComposerLayout {
-    let width = width.max(1);
-    let mut lines = vec![String::new()];
-    let mut row = 0;
-    let mut col = 0;
-    let mut cursor_position = None;
-
-    let mut previous = None;
-    for (index, ch) in text.char_indices() {
-        let char_width = ch.width().unwrap_or(0);
-        let word_start = ch != '\n'
-            && !ch.is_whitespace()
-            && previous.is_none_or(|previous: char| previous.is_whitespace());
-        if word_start {
-            let word_width = text[index..]
-                .chars()
-                .take_while(|candidate| !candidate.is_whitespace())
-                .map(|candidate| candidate.width().unwrap_or(0))
-                .sum::<usize>();
-            if col > 0 && col + word_width > width {
-                row += 1;
-                col = 0;
-                lines.push(String::new());
-            }
-        }
-        if ch != '\n' && col > 0 && col + char_width > width {
-            row += 1;
-            col = 0;
-            lines.push(String::new());
-            if ch.is_whitespace() {
-                if index == cursor {
-                    cursor_position = Some((row, col));
-                }
-                previous = Some(ch);
-                continue;
-            }
-        }
-        if index == cursor {
-            cursor_position = Some((row, col));
-        }
-        if ch == '\n' {
-            row += 1;
-            col = 0;
-            lines.push(String::new());
-        } else {
-            lines[row].push(ch);
-            col += char_width;
-            // Keep the insertion cursor inside the composer when a line is
-            // exactly full. The next character will continue on this row.
-            if col == width && index + ch.len_utf8() == cursor {
-                row += 1;
-                col = 0;
-                lines.push(String::new());
-                cursor_position = Some((row, col));
-            }
-        }
-        previous = Some(ch);
-    }
-    if cursor == text.len() && cursor_position.is_none() {
-        if col >= width {
-            row += 1;
-            col = 0;
-            lines.push(String::new());
-        }
-        cursor_position = Some((row, col));
-    }
-    let (cursor_row, cursor_col) = cursor_position.unwrap_or((row, col));
-    ComposerLayout {
-        lines,
-        cursor_row,
-        cursor_col,
-    }
-}
-
-fn draw_composer(frame: &mut Frame, state: &AppState, layout: &ComposerLayout, area: Rect) {
+fn draw_composer(
+    frame: &mut Frame,
+    state: &AppState,
+    layout: &ComposerLayout,
+    suggestions: &[(&str, &str)],
+    area: Rect,
+) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(DIM))
@@ -801,11 +1140,35 @@ fn draw_composer(frame: &mut Frame, state: &AppState, layout: &ComposerLayout, a
             Rect::new(inner.x, inner.y, inner.width, attachment_height),
         );
     }
+    let suggestions_y = inner.y.saturating_add(attachment_height);
+    let suggestion_height = (suggestions.len() as u16).min(
+        inner
+            .height
+            .saturating_sub(attachment_height)
+            .saturating_sub(1),
+    );
+    if suggestion_height > 0 {
+        let lines = suggestions
+            .iter()
+            .take(suggestion_height as usize)
+            .map(|(command, description)| {
+                Line::from(vec![
+                    Span::styled(format!("{command:<12}"), Style::default().fg(ACCENT)),
+                    Span::styled(*description, Style::default().fg(DIM)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(inner.x, suggestions_y, inner.width, suggestion_height),
+        );
+    }
+    let content_height = attachment_height.saturating_add(suggestion_height);
     let input_area = Rect::new(
         inner.x,
-        inner.y.saturating_add(attachment_height),
+        inner.y.saturating_add(content_height),
         inner.width,
-        inner.height.saturating_sub(attachment_height),
+        inner.height.saturating_sub(content_height),
     );
 
     let visible_lines = input_area.height.max(1) as usize;
@@ -878,7 +1241,6 @@ fn attachment_labels(images: &[ImageAttachment]) -> Vec<String> {
 fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
     let list_height = |len: usize, max: usize| len.clamp(1, max) as u16 + 3;
     match popup {
-        Popup::Palette { .. } => list_height(palette_items().len(), 8),
         Popup::Models { .. } => list_height(state.models.len(), 12),
         Popup::CollaborationModes { .. } => list_height(state.collaboration_modes.len(), 8),
         Popup::Reasoning { .. } => {
@@ -892,6 +1254,16 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
         }
         Popup::Resume { loading, .. } => {
             list_height(if *loading { 1 } else { state.threads.len() }, 14)
+        }
+        Popup::History { .. } => {
+            list_height(
+                state
+                    .blocks
+                    .iter()
+                    .filter(|block| block.kind == BlockKind::User)
+                    .count(),
+                14,
+            ) + 1
         }
         Popup::Login { url, error } => {
             if url.is_none() && error.is_none() {
@@ -941,16 +1313,6 @@ fn visual_line_count(text: &str, width: u16) -> usize {
 
 fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Rect) {
     match popup {
-        Popup::Palette { selected } => draw_list_panel(
-            frame,
-            "Command",
-            palette_items()
-                .iter()
-                .map(|item| item.to_string())
-                .collect(),
-            selected,
-            area,
-        ),
         Popup::Models { selected } => draw_list_panel(
             frame,
             "Model",
@@ -966,6 +1328,7 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 })
                 .collect(),
             selected,
+            0,
             area,
         ),
         Popup::CollaborationModes { selected } => draw_list_panel(
@@ -977,6 +1340,7 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 .map(|mode| mode.name.clone())
                 .collect(),
             selected,
+            0,
             area,
         ),
         Popup::Reasoning { selected } => {
@@ -986,7 +1350,7 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 .and_then(|id| state.models.iter().find(|model| &model.id == id))
                 .map(|model| model.efforts.clone())
                 .unwrap_or_default();
-            draw_list_panel(frame, "Reasoning", efforts, selected, area)
+            draw_list_panel(frame, "Reasoning", efforts, selected, 0, area)
         }
         Popup::Resume { selected, loading } => {
             let entries = if loading {
@@ -1011,27 +1375,35 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                     })
                     .collect()
             };
-            draw_list_panel(frame, "Resume", entries, selected, area);
+            draw_list_panel(frame, "Resume", entries, selected, 0, area);
+        }
+        Popup::History { selected } => {
+            let messages = state
+                .blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::User)
+                .collect::<Vec<_>>();
+            let entries = if messages.is_empty() {
+                vec!["No messages yet".to_string()]
+            } else {
+                messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| {
+                        let preview = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        format!("{}  {}", index + 1, truncate(&preview, 72))
+                    })
+                    .collect()
+            };
+            draw_list_panel(frame, "History · Enter to jump", entries, selected, 1, area);
         }
         Popup::Login { url, error } => {
-            if url.is_none() && error.is_none() {
-                draw_action_panel(
-                    frame,
-                    "Account",
-                    "Not signed in",
-                    &["Login with ChatGPT"],
-                    0,
-                    0,
-                    area,
-                );
-            } else {
-                draw_text_panel(
-                    frame,
-                    "Account",
-                    account_text(url.as_deref(), error.as_deref()),
-                    area,
-                );
-            }
+            draw_text_panel(
+                frame,
+                "Account",
+                account_text(url.as_deref(), error.as_deref()),
+                area,
+            );
         }
         Popup::Approval(approval) => {
             draw_approval_panel(frame, &approval, area);
@@ -1053,11 +1425,11 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
 
 fn account_text(url: Option<&str>, error: Option<&str>) -> String {
     if let Some(error) = error {
-        format!("Not signed in\n\n{error}")
+        format!("Sign-in failed\n\n{error}\n\nRestart Magdex to retry.")
     } else if let Some(url) = url {
         format!("Complete sign-in in your browser.\n\nIf it did not open:\n{url}")
     } else {
-        "Not signed in".to_string()
+        "Sign-in required\n\nStarting ChatGPT login…".to_string()
     }
 }
 
@@ -1088,9 +1460,10 @@ fn draw_list_panel(
     title: &str,
     items: Vec<String>,
     selected: usize,
+    bottom_padding: u16,
     area: Rect,
 ) {
-    let block = panel_block(title, 0);
+    let block = panel_block(title, bottom_padding);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -1341,6 +1714,180 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_has_symmetric_vertical_padding_and_omits_context_percent() {
+        let backend = ratatui::backend::TestBackend::new(80, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/home/user/magdex".into(), true);
+        state.project = "~/magdex".into();
+        state.model = Some("gpt-test".into());
+        state.effort = Some("high".into());
+
+        terminal
+            .draw(|frame| draw_header(frame, &state, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).trim().is_empty());
+        assert!(row(1).contains("~/magdex"));
+        assert!(row(1).contains("gpt-test · high · default"));
+        assert!(!row(1).contains('%'));
+        assert!(row(2).trim().is_empty());
+        assert_eq!(row(3), "▔".repeat(80));
+    }
+
+    #[test]
+    fn exploratory_commands_show_semantics_instead_of_shell_output() {
+        let mut block = TranscriptBlock::new(
+            BlockKind::Command,
+            "rg -n needle src",
+            "src/app.rs:1:needle",
+        );
+        block.action_status = Some(ActionStatus::Completed);
+        block.exit_code = Some(0);
+        block.command_actions = vec![CommandAction {
+            kind: CommandActionKind::Search,
+            label: "needle in src".into(),
+        }];
+        let mut lines = Vec::new();
+
+        append_command(&mut lines, &block, 80, true);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Explored"));
+        assert!(rendered.contains("Search needle in src"));
+        assert!(!rendered.contains("Shell"));
+        assert!(!rendered.contains("src/app.rs:1:needle"));
+        let search = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "Search")
+            .unwrap();
+        assert_eq!(search.style.fg, Some(ACCENT));
+    }
+
+    #[test]
+    fn file_changes_render_relative_paths_and_colored_diffs() {
+        let mut block = TranscriptBlock::new(BlockKind::File, "Files", "");
+        block.action_status = Some(ActionStatus::Completed);
+        let diff = std::iter::once("@@ -10,3 +10,16 @@".to_string())
+            .chain(std::iter::once(" context before".to_string()))
+            .chain(std::iter::once("-old".to_string()))
+            .chain((0..14).map(|index| format!("+line{index}")))
+            .chain(std::iter::once(" context after".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        block.file_changes = vec![FileChange {
+            kind: FileChangeKind::Update,
+            path: "/project/src/ui.rs".into(),
+            move_path: None,
+            diff,
+        }];
+        let mut lines = Vec::new();
+
+        append_file_changes(&mut lines, &block, 80, 80, "/project");
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Edited src/ui.rs (+14 -1)"));
+        assert!(!rendered.contains("@@"));
+        assert!(!rendered.contains("Ctrl+O"));
+        let removed = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "old"))
+            .unwrap();
+        let added = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "line0"))
+            .unwrap();
+        let last_added = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "line13"))
+            .unwrap();
+        let context = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content == "context before")
+            })
+            .unwrap();
+        assert_eq!(removed.style.bg, Some(DIFF_REMOVE_BACKGROUND));
+        assert_eq!(added.style.bg, Some(DIFF_ADD_BACKGROUND));
+        assert_eq!(removed.width(), 80);
+        assert_eq!(added.width(), 80);
+        assert_eq!(context.style.bg, None);
+        assert!(removed
+            .spans
+            .iter()
+            .find(|span| span.content == "old")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::DIM));
+        let line_text = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(line_text(context).contains("10   context before"));
+        assert!(line_text(removed).contains("11 - old"));
+        assert!(line_text(added).contains("11 + line0"));
+        assert!(line_text(last_added).contains("24 + line13"));
+    }
+
+    #[test]
+    fn long_single_line_command_output_collapses_by_visual_rows() {
+        let mut block = TranscriptBlock::new(
+            BlockKind::Command,
+            "cargo metadata --locked",
+            "x".repeat(200),
+        );
+        block.action_status = Some(ActionStatus::Completed);
+        block.exit_code = Some(0);
+        let mut lines = Vec::new();
+
+        append_command(&mut lines, &block, 24, true);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Ran"));
+        assert!(rendered.contains("Ctrl+O to expand"));
+        let flag = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "--locked")
+            .unwrap();
+        assert_eq!(flag.style.fg, Some(DIM));
+        assert!(lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| { span.content.contains('x') && span.style.fg == Some(DIM) }));
+
+        block.expanded = true;
+        let mut old_lines = Vec::new();
+        append_command(&mut old_lines, &block, 24, false);
+        let old_rendered = old_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(old_rendered.contains("… +"));
+        assert!(!old_rendered.contains("Ctrl+O"));
+    }
+
+    #[test]
     fn truncates_by_terminal_width() {
         assert_eq!(truncate("hello", 8), "hello");
         assert_eq!(truncate("hello world", 6), "hello…");
@@ -1420,18 +1967,24 @@ mod tests {
             &TranscriptBlock::new(BlockKind::User, "You", "question"),
             76,
             80,
+            "/project",
+            false,
         );
         append_block(
             &mut lines,
             &TranscriptBlock::new(BlockKind::Assistant, "Codex", "answer"),
             76,
             80,
+            "/project",
+            false,
         );
         append_block(
             &mut lines,
             &TranscriptBlock::new(BlockKind::TurnEnd, "", "9m 55s"),
             76,
             80,
+            "/project",
+            false,
         );
 
         assert_eq!(lines[0].width(), 80);
@@ -1501,7 +2054,7 @@ mod tests {
         state.composer.cursor = state.composer.text.len();
         let layout = layout_composer(&state.composer.text, state.composer.cursor, 34);
         terminal
-            .draw(|frame| draw_composer(frame, &state, &layout, frame.area()))
+            .draw(|frame| draw_composer(frame, &state, &layout, &[], frame.area()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -1524,7 +2077,7 @@ mod tests {
         let layout = layout_composer("", 0, 42);
 
         terminal
-            .draw(|frame| draw_composer(frame, &state, &layout, frame.area()))
+            .draw(|frame| draw_composer(frame, &state, &layout, &[], frame.area()))
             .unwrap();
 
         let rendered = terminal
@@ -1614,6 +2167,53 @@ mod tests {
         assert_eq!(buffer[(49, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, COMPOSER_BACKGROUND);
         assert_eq!(buffer[(49, 3)].bg, COMPOSER_BACKGROUND);
+    }
+
+    #[test]
+    fn message_history_lists_compact_previews() {
+        let backend = ratatui::backend::TestBackend::new(60, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![
+            TranscriptBlock::new(BlockKind::User, "You", "first message"),
+            TranscriptBlock::new(BlockKind::Assistant, "Codex", "answer"),
+            TranscriptBlock::new(BlockKind::User, "You", "second\nmessage"),
+        ];
+
+        terminal
+            .draw(|frame| {
+                draw_bottom_panel(frame, &state, Popup::History { selected: 1 }, frame.area())
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("History · Enter to jump"));
+        assert!(rendered.contains("1  first message"));
+        assert!(rendered.contains("2  second message"));
+    }
+
+    #[test]
+    fn transcript_cache_tracks_user_messages_for_history_jumps() {
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![
+            TranscriptBlock::new(BlockKind::User, "You", "first"),
+            TranscriptBlock::new(BlockKind::Assistant, "Codex", "answer"),
+            TranscriptBlock::new(BlockKind::User, "You", "second"),
+        ];
+        state.mark_transcript_dirty();
+
+        rebuild_transcript_cache(&mut state, 60);
+        let expected = state.transcript_block_offsets[2].unwrap();
+
+        assert!(state.jump_to_user_message(1));
+        assert_eq!(state.scroll, expected);
+        assert!(expected > state.transcript_block_offsets[0].unwrap());
     }
 
     #[test]
@@ -1775,6 +2375,43 @@ mod tests {
         let layout = layout_composer("аб\nв\n", "аб\nв\n".len(), 8);
         assert_eq!(layout.lines, ["аб", "в", ""]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn slash_command_suggestions_filter_as_the_user_types() {
+        let all = slash_command_suggestions("/");
+        assert_eq!(all.len(), SLASH_COMMANDS.len());
+
+        let filtered = slash_command_suggestions("/re")
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, ["/resume", "/reasoning"]);
+        assert!(slash_command_suggestions("hello").is_empty());
+        assert!(slash_command_suggestions("/resume now").is_empty());
+    }
+
+    #[test]
+    fn slash_command_suggestions_render_above_the_composer() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.composer.replace("/re".into());
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("/resume"));
+        assert!(rendered.contains("Resume conversation"));
+        assert!(rendered.contains("/reasoning"));
+        assert!(rendered.contains("› /re"));
+        assert!(!rendered.contains("Change model"));
     }
 
     #[test]

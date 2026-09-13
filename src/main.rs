@@ -83,7 +83,9 @@ async fn main() -> Result<()> {
                     event.as_ref().is_ok_and(|event| event_requests_redraw(event, config.mouse))
                 });
                 match event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Some(Ok(Event::Key(key)))
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         let restart = matches!(
                             controller.state.popup,
                             Some(model::Popup::Disconnected { selected: 0, .. })
@@ -161,7 +163,7 @@ fn next_working_redraw(started: std::time::Instant, now: std::time::Instant) -> 
 
 fn event_requests_redraw(event: &Event, mouse: bool) -> bool {
     match event {
-        Event::Key(key) => key.kind == KeyEventKind::Press,
+        Event::Key(key) => matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat),
         Event::Mouse(mouse_event) => {
             mouse
                 && matches!(

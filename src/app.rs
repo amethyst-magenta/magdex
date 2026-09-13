@@ -8,24 +8,25 @@ use serde_json::{json, Value};
 
 use crate::{
     model::{
-        AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo, ImageAttachment,
-        ModelInfo, Popup, ResumePicker, ServerPrompt, ThreadSummary, TranscriptBlock,
-        UserInputOption, UserInputQuestion, UserInputRequest,
+        ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
+        CommandAction, CommandActionKind, FileChange, FileChangeKind, ImageAttachment, ModelInfo,
+        Popup, ResumePicker, ServerPrompt, ThreadSummary, TranscriptBlock, UserInputOption,
+        UserInputQuestion, UserInputRequest,
     },
     rpc::{Incoming, RpcClient},
 };
 
-const PALETTE: [&str; 7] = [
-    "New conversation",
-    "Resume conversation",
-    "Change mode",
-    "Change model",
-    "Change reasoning",
-    "Login / account",
-    "Quit",
-];
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_OUTPUT_TRUNCATED: &str = "\n[… command output truncated by Magdex …]";
+pub const SLASH_COMMANDS: [(&str, &str); 7] = [
+    ("/new", "New conversation"),
+    ("/resume", "Resume conversation"),
+    ("/mode", "Change mode"),
+    ("/model", "Change model"),
+    ("/reasoning", "Change reasoning effort"),
+    ("/history", "Jump to a message"),
+    ("/bottom", "Jump to latest output"),
+];
 
 #[derive(Debug)]
 enum Pending {
@@ -726,9 +727,12 @@ impl Controller {
                 self.open_reasoning();
                 Ok(())
             }
-            "/login" => self.begin_login(),
-            "/quit" => {
-                self.state.quit = true;
+            "/history" => {
+                self.open_history();
+                Ok(())
+            }
+            "/bottom" => {
+                self.state.jump_to_bottom();
                 Ok(())
             }
             _ => {
@@ -759,6 +763,18 @@ impl Controller {
             .and_then(|current| self.state.models.iter().position(|m| &m.id == current))
             .unwrap_or(0);
         self.state.popup = Some(Popup::Models { selected });
+    }
+
+    fn open_history(&mut self) {
+        let message_count = self
+            .state
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::User)
+            .count();
+        self.state.popup = Some(Popup::History {
+            selected: message_count.saturating_sub(1),
+        });
     }
 
     fn open_collaboration_modes(&mut self) {
@@ -886,36 +902,34 @@ impl Controller {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('p') => {
-                    self.state.popup = Some(Popup::Palette { selected: 0 });
-                }
-                KeyCode::Char('r') => self.request_threads()?,
+                KeyCode::Char('p') => self.state.previous_message(),
+                KeyCode::Char('n') => self.state.next_message(),
+                KeyCode::Char('k') => self.scroll_up(3),
+                KeyCode::Char('j') => self.scroll_down(3),
+                KeyCode::Char('g') => self.state.jump_to_bottom(),
                 KeyCode::Char('o') => {
-                    if let Some(block) = self
-                        .state
-                        .blocks
-                        .iter_mut()
-                        .rev()
-                        .find(|block| block.kind == BlockKind::Command)
-                    {
-                        block.expanded = !block.expanded;
+                    let toggled = if let Some(block) =
+                        self.state.blocks.iter_mut().rev().find(|block| {
+                            matches!(
+                                block.kind,
+                                BlockKind::Command | BlockKind::File | BlockKind::Web
+                            )
+                        }) {
+                        if block.kind == BlockKind::Command {
+                            block.expanded = !block.expanded;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if toggled {
                         self.state.mark_transcript_dirty();
                     }
                 }
-                KeyCode::Char('a') => {
-                    self.state.composer.cursor = self.state.composer.text
-                        [..self.state.composer.cursor]
-                        .rfind('\n')
-                        .map(|position| position + 1)
-                        .unwrap_or(0);
-                }
-                KeyCode::Char('e') => {
-                    self.state.composer.cursor = self.state.composer.text
-                        [self.state.composer.cursor..]
-                        .find('\n')
-                        .map(|offset| self.state.composer.cursor + offset)
-                        .unwrap_or(self.state.composer.text.len());
-                }
+                KeyCode::Char('a') => self.state.composer.move_to_line_start(),
+                KeyCode::Char('e') => self.state.composer.move_to_line_end(),
                 _ => {}
             }
             return Ok(());
@@ -931,12 +945,8 @@ impl Controller {
             KeyCode::Delete => self.state.composer.delete(),
             KeyCode::Left => self.state.composer.left(),
             KeyCode::Right => self.state.composer.right(),
-            KeyCode::Up => self.state.previous_message(),
-            KeyCode::Down => self.state.next_message(),
-            KeyCode::Home => self.scroll_home(),
-            KeyCode::End => self.scroll_end(),
-            KeyCode::PageUp => self.scroll_up(10),
-            KeyCode::PageDown => self.scroll_down(10),
+            KeyCode::Up => self.state.composer.up(self.state.composer_width),
+            KeyCode::Down => self.state.composer.down(self.state.composer_width),
             _ => {}
         }
         Ok(())
@@ -986,25 +996,14 @@ impl Controller {
             return self.handle_user_input_key(key);
         }
         if key.code == KeyCode::Esc {
+            if matches!(self.state.popup, Some(Popup::Login { .. })) {
+                return Ok(());
+            }
             self.state.popup = None;
             return Ok(());
         }
 
         match self.state.popup.clone() {
-            Some(Popup::Palette { selected }) => match key.code {
-                KeyCode::Char('k') => {
-                    self.state.popup = Some(Popup::Palette {
-                        selected: selected.saturating_sub(1),
-                    });
-                }
-                KeyCode::Char('j') => {
-                    self.state.popup = Some(Popup::Palette {
-                        selected: (selected + 1).min(PALETTE.len() - 1),
-                    });
-                }
-                KeyCode::Enter => return self.choose_palette(selected),
-                _ => {}
-            },
             Some(Popup::Models { selected }) => match key.code {
                 KeyCode::Char('k') => {
                     self.state.popup = Some(Popup::Models {
@@ -1096,40 +1095,32 @@ impl Controller {
                 KeyCode::Enter => return self.resume(selected),
                 _ => {}
             },
-            Some(Popup::Login {
-                url: None,
-                error: None,
-            }) if key.code == KeyCode::Enter => {
-                return self.begin_login();
-            }
+            Some(Popup::History { selected }) => match key.code {
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.state.popup = Some(Popup::History {
+                        selected: selected.saturating_sub(1),
+                    });
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let message_count = self
+                        .state
+                        .blocks
+                        .iter()
+                        .filter(|block| block.kind == BlockKind::User)
+                        .count();
+                    self.state.popup = Some(Popup::History {
+                        selected: (selected + 1).min(message_count.saturating_sub(1)),
+                    });
+                }
+                KeyCode::Enter => {
+                    self.state.jump_to_user_message(selected);
+                    self.state.popup = None;
+                }
+                _ => {}
+            },
             _ => {}
         }
         Ok(())
-    }
-
-    fn choose_palette(&mut self, selected: usize) -> Result<()> {
-        match selected {
-            0 => self.new_conversation(),
-            1 => self.request_threads(),
-            2 => {
-                self.open_collaboration_modes();
-                Ok(())
-            }
-            3 => {
-                self.open_models();
-                Ok(())
-            }
-            4 => {
-                self.open_reasoning();
-                Ok(())
-            }
-            5 => self.begin_login(),
-            6 => {
-                self.state.quit = true;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1401,6 +1392,7 @@ impl Controller {
     fn handle_notification(&mut self, method: &str, params: Value) -> Result<()> {
         match method {
             "turn/started" => {
+                self.state.jump_to_bottom();
                 self.state.turn_id = params
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
@@ -1461,20 +1453,7 @@ impl Controller {
             "item/commandExecution/outputDelta" => {
                 append_delta(&mut self.state, &params, BlockKind::Command, "$ command")
             }
-            "thread/tokenUsage/updated" => {
-                let used = params
-                    .pointer("/tokenUsage/total/totalTokens")
-                    .and_then(Value::as_u64);
-                let window = params
-                    .pointer("/tokenUsage/modelContextWindow")
-                    .and_then(Value::as_u64);
-                if let (Some(used), Some(window)) = (used, window) {
-                    self.state.context_percent = Some(
-                        (100_u64.saturating_sub(used.saturating_mul(100) / window.max(1))).min(100)
-                            as u8,
-                    );
-                }
-            }
+            "item/fileChange/patchUpdated" => update_file_change_patch(&mut self.state, &params),
             "thread/settings/updated" => {
                 if let Some(mode) = params
                     .pointer("/threadSettings/collaborationMode/mode")
@@ -1568,17 +1547,6 @@ impl Controller {
 
     pub fn scroll_down(&mut self, amount: usize) {
         self.state.scroll = self.state.scroll.saturating_add(amount);
-    }
-
-    pub fn scroll_home(&mut self) {
-        self.state.scroll = 0;
-        self.state.at_bottom = false;
-    }
-
-    pub fn scroll_end(&mut self) {
-        self.state.scroll = usize::MAX;
-        self.state.at_bottom = true;
-        self.state.new_output = false;
     }
 
     pub async fn shutdown(self) {
@@ -1775,61 +1743,28 @@ fn block_from_item(item: &Value, completed: bool, show_reasoning: bool) -> Optio
         ),
         "commandExecution" => {
             let command = display_command(item);
-            let output = sanitize_terminal_output(
+            let mut output = sanitize_terminal_output(
                 item.get("aggregatedOutput")
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             );
-            let status = if completed {
-                item.get("exitCode")
-                    .and_then(Value::as_i64)
-                    .map(|code| format!("exit {code}"))
-                    .unwrap_or_else(|| {
-                        item.get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("completed")
-                            .to_string()
-                    })
-            } else {
-                "running…".to_string()
-            };
-            let mut text = if output.is_empty() {
-                status
-            } else {
-                format!("{status}\n{output}")
-            };
-            truncate_command_output(&mut text);
-            TranscriptBlock::new(BlockKind::Command, format!("$ {command}"), text)
+            truncate_command_output(&mut output);
+            let mut block = TranscriptBlock::new(BlockKind::Command, command, output);
+            block.action_status = Some(action_status(item, completed));
+            block.exit_code = item.get("exitCode").and_then(Value::as_i64);
+            block.command_actions = command_actions_from_item(item);
+            block
         }
         "fileChange" => {
-            let lines = item
-                .get("changes")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|change| {
-                    let symbol = match change.get("kind").and_then(Value::as_str) {
-                        Some("add") => "+",
-                        Some("delete") => "-",
-                        _ => "~",
-                    };
-                    let path = change
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown file");
-                    format!("{symbol} {path}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            TranscriptBlock::new(BlockKind::File, "Files", lines)
+            let mut block = TranscriptBlock::new(BlockKind::File, "Files", "");
+            block.action_status = Some(action_status(item, completed));
+            block.file_changes = file_changes_from_item(item);
+            block
         }
-        "webSearch" => TranscriptBlock::new(
-            BlockKind::Web,
-            "web",
-            item.get("query")
-                .and_then(Value::as_str)
-                .unwrap_or("search"),
-        ),
+        "webSearch" => {
+            let (title, detail) = web_action_display(item);
+            TranscriptBlock::new(BlockKind::Web, title, detail)
+        }
         "error" => TranscriptBlock::new(
             BlockKind::Error,
             "Error",
@@ -1841,6 +1776,144 @@ fn block_from_item(item: &Value, completed: bool, show_reasoning: bool) -> Optio
     };
     block.id = id;
     Some(block)
+}
+
+fn action_status(item: &Value, completed: bool) -> ActionStatus {
+    match item.get("status").and_then(Value::as_str) {
+        Some("inProgress") => ActionStatus::InProgress,
+        Some("completed") => ActionStatus::Completed,
+        Some("failed") => ActionStatus::Failed,
+        Some("declined") => ActionStatus::Declined,
+        _ if completed => ActionStatus::Completed,
+        _ => ActionStatus::InProgress,
+    }
+}
+
+fn command_actions_from_item(item: &Value) -> Vec<CommandAction> {
+    item.get("commandActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| {
+            let action_type = action.get("type").and_then(Value::as_str);
+            let command = action
+                .get("command")
+                .and_then(Value::as_str)
+                .map(normalize_shell_command)
+                .unwrap_or_default();
+            let (kind, label) = match action_type {
+                Some("read") => (
+                    CommandActionKind::Read,
+                    first_string(action, &["name", "path"]).unwrap_or(command),
+                ),
+                Some("listFiles") => (CommandActionKind::ListFiles, command),
+                Some("search") => {
+                    let query = first_string(action, &["query"]);
+                    let path = first_string(action, &["path"]);
+                    let label = match (query, path) {
+                        (Some(query), Some(path)) => format!("{query} in {path}"),
+                        (Some(query), None) => query,
+                        _ => command,
+                    };
+                    (CommandActionKind::Search, label)
+                }
+                _ => (CommandActionKind::Unknown, command),
+            };
+            (!label.is_empty()).then_some(CommandAction { kind, label })
+        })
+        .collect()
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn file_changes_from_item(item: &Value) -> Vec<FileChange> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            let path = change.get("path")?.as_str()?.to_string();
+            let kind_value = change.get("kind");
+            let kind_name = kind_value
+                .and_then(|kind| kind.get("type"))
+                .and_then(Value::as_str)
+                .or_else(|| kind_value.and_then(Value::as_str));
+            let kind = match kind_name {
+                Some("add") => FileChangeKind::Add,
+                Some("delete") => FileChangeKind::Delete,
+                Some("update") => FileChangeKind::Update,
+                _ => FileChangeKind::Unknown,
+            };
+            let move_path = kind_value
+                .and_then(|kind| kind.get("move_path"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let diff = change
+                .get("diff")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(FileChange {
+                kind,
+                path,
+                move_path,
+                diff,
+            })
+        })
+        .collect()
+}
+
+fn update_file_change_patch(state: &mut AppState, params: &Value) {
+    let Some(id) = params.get("itemId").and_then(Value::as_str) else {
+        return;
+    };
+    let mut block = TranscriptBlock::new(BlockKind::File, "Files", "");
+    block.id = Some(id.to_string());
+    block.action_status = Some(ActionStatus::InProgress);
+    block.file_changes = file_changes_from_item(params);
+    state.upsert(id, block);
+}
+
+fn web_action_display(item: &Value) -> (&'static str, String) {
+    let action = item.get("action");
+    match action
+        .and_then(|action| action.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("openPage") => (
+            "Opened",
+            action
+                .and_then(|action| action.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("a web page")
+                .to_string(),
+        ),
+        Some("findInPage") => {
+            let pattern = action
+                .and_then(|action| action.get("pattern"))
+                .and_then(Value::as_str)
+                .unwrap_or("text");
+            let url = action
+                .and_then(|action| action.get("url"))
+                .and_then(Value::as_str);
+            let detail = url
+                .map(|url| format!("{pattern} in {url}"))
+                .unwrap_or_else(|| pattern.to_string());
+            ("Found on page", detail)
+        }
+        _ => (
+            "Searched the web for",
+            item.get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("search")
+                .to_string(),
+        ),
+    }
 }
 
 fn sanitize_terminal_output(input: &str) -> String {
@@ -2178,10 +2251,6 @@ fn account_is_available(result: &Value) -> bool {
             .unwrap_or(true)
 }
 
-pub fn palette_items() -> &'static [&'static str] {
-    &PALETTE
-}
-
 pub fn relative_time(timestamp: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2455,6 +2524,104 @@ mod tests {
             ),
             r#"printf '%s\n' '{"id":1}' | codex app-server"#
         );
+    }
+
+    #[test]
+    fn command_items_preserve_semantic_actions_and_status() {
+        let item = json!({
+            "id": "command-1",
+            "type": "commandExecution",
+            "command": "/usr/bin/zsh -lc \"rg -n needle src\"",
+            "commandActions": [{
+                "type": "search",
+                "command": "rg -n needle src",
+                "query": "needle",
+                "path": "src"
+            }],
+            "aggregatedOutput": "src/app.rs:1:needle",
+            "status": "completed",
+            "exitCode": 0
+        });
+
+        let block = block_from_item(&item, true, true).unwrap();
+        assert_eq!(block.action_status, Some(ActionStatus::Completed));
+        assert_eq!(block.exit_code, Some(0));
+        assert_eq!(
+            block.command_actions,
+            vec![CommandAction {
+                kind: CommandActionKind::Search,
+                label: "needle in src".into()
+            }]
+        );
+        assert_eq!(block.text, "src/app.rs:1:needle");
+    }
+
+    #[test]
+    fn file_change_items_preserve_kind_move_and_diff() {
+        let item = json!({
+            "id": "file-1",
+            "type": "fileChange",
+            "status": "completed",
+            "changes": [{
+                "path": "/project/old.rs",
+                "kind": {"type": "update", "move_path": "/project/new.rs"},
+                "diff": "@@ -1 +1 @@\n-old\n+new"
+            }]
+        });
+
+        let block = block_from_item(&item, true, true).unwrap();
+        assert_eq!(block.action_status, Some(ActionStatus::Completed));
+        assert_eq!(
+            block.file_changes,
+            vec![FileChange {
+                kind: FileChangeKind::Update,
+                path: "/project/old.rs".into(),
+                move_path: Some("/project/new.rs".into()),
+                diff: "@@ -1 +1 @@\n-old\n+new".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn patch_updates_refresh_the_live_file_diff() {
+        let mut state = AppState::new("/project".into(), true);
+        state.clear_blocks();
+        update_file_change_patch(
+            &mut state,
+            &json!({
+                "itemId": "file-1",
+                "changes": [{
+                    "path": "/project/src/ui.rs",
+                    "kind": {"type": "update", "move_path": null},
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                }]
+            }),
+        );
+
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].id.as_deref(), Some("file-1"));
+        assert_eq!(
+            state.blocks[0].action_status,
+            Some(ActionStatus::InProgress)
+        );
+        assert_eq!(state.blocks[0].file_changes[0].path, "/project/src/ui.rs");
+    }
+
+    #[test]
+    fn web_items_use_the_specific_action_label() {
+        let opened = block_from_item(
+            &json!({
+                "id": "web-1",
+                "type": "webSearch",
+                "query": "fallback",
+                "action": {"type": "openPage", "url": "https://example.com"}
+            }),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(opened.title, "Opened");
+        assert_eq!(opened.text, "https://example.com");
     }
 
     #[test]
