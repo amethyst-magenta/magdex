@@ -22,6 +22,12 @@ cd ~/code/my-project
 magdex
 ```
 
+Choose one of the recent conversations from the current directory:
+
+```bash
+magdex resume
+```
+
 ## Keys
 
 | Key | Action |
@@ -36,6 +42,7 @@ magdex
 | `Home` / `End` | Top / follow newest output |
 | Mouse wheel | Scroll transcript |
 | `Ctrl+O` | Expand the latest long command output |
+| `↑` / `↓` | Recall older/newer messages in the composer |
 | `Esc` | Close the bottom panel (or cancel an approval) |
 | `↑` / `↓` or `j` / `k` | Choose an answer when Codex asks a structured question |
 

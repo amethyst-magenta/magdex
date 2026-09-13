@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use crate::{
     model::{
         AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo, ImageAttachment,
-        ModelInfo, Popup, ServerPrompt, ThreadSummary, TranscriptBlock, UserInputOption,
-        UserInputQuestion, UserInputRequest,
+        ModelInfo, Popup, ResumePicker, ServerPrompt, ThreadSummary, TranscriptBlock,
+        UserInputOption, UserInputQuestion, UserInputRequest,
     },
     rpc::{Incoming, RpcClient},
 };
@@ -24,6 +24,8 @@ const PALETTE: [&str; 7] = [
     "Login / account",
     "Quit",
 ];
+const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+const COMMAND_OUTPUT_TRUNCATED: &str = "\n[… command output truncated by Magdex …]";
 
 #[derive(Debug)]
 enum Pending {
@@ -34,12 +36,24 @@ enum Pending {
     CollaborationModes,
     Config,
     StartThread,
-    ListThreads,
-    ResumeThread,
+    ListThreads(ThreadListTarget),
+    ResumeThread(ResumeTarget),
     ThreadTurns { thread_id: String },
     StartTurn,
     UpdateMode,
     Interrupt,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ThreadListTarget {
+    Popup,
+    Picker,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResumeTarget {
+    Popup,
+    Picker,
 }
 
 pub struct Controller {
@@ -56,10 +70,19 @@ impl Controller {
         show_reasoning: bool,
         default_mode_request_user_input: bool,
         debug: bool,
+        resume_on_start: bool,
     ) -> Result<Self> {
         let rpc = RpcClient::spawn(debug, default_mode_request_user_input).await?;
+        let mut state = AppState::new(cwd, show_reasoning);
+        if resume_on_start {
+            state.resume_picker = Some(ResumePicker {
+                selected: 0,
+                loading: true,
+                error: None,
+            });
+        }
         let mut this = Self {
-            state: AppState::new(cwd, show_reasoning),
+            state,
             rpc,
             pending: HashMap::new(),
             default_mode_request_user_input,
@@ -128,17 +151,33 @@ impl Controller {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| error.to_string());
-            self.state
-                .push(TranscriptBlock::new(BlockKind::Error, "Error", detail));
+            self.state.push(TranscriptBlock::new(
+                BlockKind::Error,
+                "Error",
+                detail.clone(),
+            ));
             match pending {
-                Pending::ListThreads => {
+                Pending::ListThreads(ThreadListTarget::Popup) => {
                     self.state.popup = Some(Popup::Resume {
                         selected: 0,
                         loading: false,
                     });
                 }
-                Pending::ResumeThread | Pending::ThreadTurns { .. } => {
+                Pending::ListThreads(ThreadListTarget::Picker) => {
+                    self.state.resume_picker = Some(ResumePicker {
+                        selected: 0,
+                        loading: false,
+                        error: Some(detail),
+                    });
+                }
+                Pending::ResumeThread(ResumeTarget::Popup) | Pending::ThreadTurns { .. } => {
                     self.state.popup = None;
+                }
+                Pending::ResumeThread(ResumeTarget::Picker) => {
+                    if let Some(picker) = self.state.resume_picker.as_mut() {
+                        picker.loading = false;
+                        picker.error = Some(detail);
+                    }
                 }
                 Pending::StartTurn => {
                     self.state.turn_id = None;
@@ -169,13 +208,13 @@ impl Controller {
                 self.load_thread_response(&result, false);
                 Ok(())
             }
-            Pending::ListThreads => {
-                self.apply_thread_list(&result);
+            Pending::ListThreads(target) => {
+                self.apply_thread_list(&result, target);
                 Ok(())
             }
-            Pending::ResumeThread => {
+            Pending::ResumeThread(_) => {
                 self.load_thread_response(&result, true);
-                self.state.blocks.clear();
+                self.state.clear_blocks();
                 self.state.push(TranscriptBlock::new(
                     BlockKind::Status,
                     "Codex",
@@ -213,7 +252,11 @@ impl Controller {
             json!({"cwd": self.state.cwd, "includeLayers": false}),
         )?;
         self.pending.insert(config, Pending::Config);
-        self.start_thread()?;
+        if self.state.resume_picker.is_some() {
+            self.request_threads_for(ThreadListTarget::Picker)?;
+        } else {
+            self.start_thread()?;
+        }
         Ok(())
     }
 
@@ -366,7 +409,8 @@ impl Controller {
         if self.state.collaboration_mode == "default" {
             self.state.default_mode_effort = self.state.effort.clone();
         }
-        self.state.blocks.clear();
+        self.state.clear_blocks();
+        self.state.clear_message_history();
         if resumed {
             self.load_history(thread);
         }
@@ -382,6 +426,7 @@ impl Controller {
             ));
         }
         self.state.popup = None;
+        self.state.resume_picker = None;
         self.state.scroll = usize::MAX;
         self.state.at_bottom = true;
     }
@@ -399,66 +444,64 @@ impl Controller {
                 .into_iter()
                 .flatten()
             {
+                if let Some(text) = user_message_text(item) {
+                    self.state.remember_message(text);
+                }
                 if let Some(block) = block_from_item(item, true, self.state.show_reasoning) {
-                    self.state.blocks.push(block);
+                    self.state.push(block);
                 }
             }
             if let Some(duration_ms) = turn_duration_ms(turn) {
-                self.state.blocks.push(turn_end_block(duration_ms));
+                self.state.push(turn_end_block(duration_ms));
             }
         }
     }
 
     fn request_threads(&mut self) -> Result<()> {
+        self.request_threads_for(ThreadListTarget::Popup)
+    }
+
+    fn request_threads_for(&mut self, target: ThreadListTarget) -> Result<()> {
         self.state.threads.clear();
-        self.state.popup = Some(Popup::Resume {
-            selected: 0,
-            loading: true,
-        });
-        let id = self.rpc.request(
-            "thread/list",
-            json!({"limit": 50, "sortKey": "updated_at", "sortDirection": "desc"}),
-        )?;
-        self.pending.insert(id, Pending::ListThreads);
+        match target {
+            ThreadListTarget::Popup => {
+                self.state.popup = Some(Popup::Resume {
+                    selected: 0,
+                    loading: true,
+                });
+            }
+            ThreadListTarget::Picker => {
+                self.state.resume_picker = Some(ResumePicker {
+                    selected: 0,
+                    loading: true,
+                    error: None,
+                });
+            }
+        }
+        let id = self
+            .rpc
+            .request("thread/list", thread_list_params(&self.state.cwd))?;
+        self.pending.insert(id, Pending::ListThreads(target));
         Ok(())
     }
 
-    fn apply_thread_list(&mut self, result: &Value) {
-        self.state.threads = result
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|thread| {
-                Some(ThreadSummary {
-                    id: thread.get("id")?.as_str()?.to_string(),
-                    title: thread
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .or_else(|| thread.get("preview").and_then(Value::as_str))
-                        .unwrap_or("Untitled conversation")
-                        .lines()
-                        .next()
-                        .unwrap_or("Untitled conversation")
-                        .to_string(),
-                    cwd: thread
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    updated_at: thread
-                        .get("updatedAt")
-                        .or_else(|| thread.get("createdAt"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0),
-                })
-            })
-            .collect();
-        self.state.popup = Some(Popup::Resume {
-            selected: 0,
-            loading: false,
-        });
+    fn apply_thread_list(&mut self, result: &Value, target: ThreadListTarget) {
+        self.state.threads = thread_summaries_from_response(result);
+        match target {
+            ThreadListTarget::Popup => {
+                self.state.popup = Some(Popup::Resume {
+                    selected: 0,
+                    loading: false,
+                });
+            }
+            ThreadListTarget::Picker => {
+                self.state.resume_picker = Some(ResumePicker {
+                    selected: 0,
+                    loading: false,
+                    error: None,
+                });
+            }
+        }
     }
 
     fn resume(&mut self, index: usize) -> Result<()> {
@@ -469,11 +512,27 @@ impl Controller {
             "thread/resume",
             json!({"threadId": thread.id, "excludeTurns": true}),
         )?;
-        self.pending.insert(id, Pending::ResumeThread);
-        self.state.popup = Some(Popup::Resume {
-            selected: index,
-            loading: true,
-        });
+        let target = if self.state.resume_picker.is_some() {
+            ResumeTarget::Picker
+        } else {
+            ResumeTarget::Popup
+        };
+        self.pending.insert(id, Pending::ResumeThread(target));
+        match target {
+            ResumeTarget::Popup => {
+                self.state.popup = Some(Popup::Resume {
+                    selected: index,
+                    loading: true,
+                });
+            }
+            ResumeTarget::Picker => {
+                if let Some(picker) = self.state.resume_picker.as_mut() {
+                    picker.selected = index;
+                    picker.loading = true;
+                    picker.error = None;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -503,7 +562,7 @@ impl Controller {
             && self.state.blocks[0].kind == BlockKind::Status
             && self.state.blocks[0].text == "Loading conversation…"
         {
-            self.state.blocks.clear();
+            self.state.clear_blocks();
         }
         for turn in result
             .get("data")
@@ -517,12 +576,15 @@ impl Controller {
                 .into_iter()
                 .flatten()
             {
+                if let Some(text) = user_message_text(item) {
+                    self.state.remember_message(text);
+                }
                 if let Some(block) = block_from_item(item, true, self.state.show_reasoning) {
-                    self.state.blocks.push(block);
+                    self.state.push(block);
                 }
             }
             if let Some(duration_ms) = turn_duration_ms(turn) {
-                self.state.blocks.push(turn_end_block(duration_ms));
+                self.state.push(turn_end_block(duration_ms));
             }
         }
         if let Some(cursor) = result.get("nextCursor").and_then(Value::as_str) {
@@ -576,6 +638,7 @@ impl Controller {
             }
         }
         let id = self.rpc.request("turn/start", params)?;
+        self.state.remember_message(text.clone());
         self.state.composer.clear();
         self.state.image_attachments.clear();
         self.state.push(TranscriptBlock::new(
@@ -599,6 +662,9 @@ impl Controller {
         if self.state.popup.is_some() {
             return;
         }
+        if self.state.resume_picker.is_some() {
+            return;
+        }
         self.state.composer.insert_str(&pasted);
     }
 
@@ -615,7 +681,7 @@ impl Controller {
             }
         };
 
-        if self.state.popup.is_none() {
+        if self.state.popup.is_none() && self.state.resume_picker.is_none() {
             if let Ok(image) = clipboard.get_image() {
                 match encode_clipboard_image(image.width, image.height, &image.bytes) {
                     Ok(attachment) => self.state.image_attachments.push(attachment),
@@ -676,6 +742,7 @@ impl Controller {
             return Ok(());
         }
         self.state.popup = None;
+        self.state.clear_message_history();
         self.start_thread()
     }
 
@@ -808,6 +875,10 @@ impl Controller {
             return self.handle_popup_key(key);
         }
 
+        if self.state.resume_picker.is_some() {
+            return self.handle_resume_picker_key(key);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('p') => {
@@ -823,6 +894,7 @@ impl Controller {
                         .find(|block| block.kind == BlockKind::Command)
                     {
                         block.expanded = !block.expanded;
+                        self.state.mark_transcript_dirty();
                     }
                 }
                 KeyCode::Char('a') => {
@@ -854,10 +926,38 @@ impl Controller {
             KeyCode::Delete => self.state.composer.delete(),
             KeyCode::Left => self.state.composer.left(),
             KeyCode::Right => self.state.composer.right(),
+            KeyCode::Up => self.state.previous_message(),
+            KeyCode::Down => self.state.next_message(),
             KeyCode::Home => self.scroll_home(),
             KeyCode::End => self.scroll_end(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_resume_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(picker) = self.state.resume_picker.as_ref() else {
+            return Ok(());
+        };
+        if picker.loading {
+            return Ok(());
+        }
+        let selected = picker.selected;
+        match key.code {
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(picker) = self.state.resume_picker.as_mut() {
+                    picker.selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(picker) = self.state.resume_picker.as_mut() {
+                    picker.selected =
+                        (selected + 1).min(self.state.threads.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => return self.resume(selected),
             _ => {}
         }
         Ok(())
@@ -1622,7 +1722,19 @@ fn append_delta(state: &mut AppState, params: &Value, kind: BlockKind, title: &s
         params.get("itemId").and_then(Value::as_str),
         params.get("delta").and_then(Value::as_str),
     ) {
-        state.append_delta(id, kind, title, delta);
+        if kind == BlockKind::Command {
+            let delta = sanitize_terminal_output(delta);
+            state.append_delta(id, kind, title, &delta);
+            if let Some(block) = state
+                .blocks
+                .iter_mut()
+                .find(|candidate| candidate.id.as_deref() == Some(id))
+            {
+                truncate_command_output(&mut block.text);
+            }
+        } else {
+            state.append_delta(id, kind, title, delta);
+        }
     }
 }
 
@@ -1657,10 +1769,11 @@ fn block_from_item(item: &Value, completed: bool, show_reasoning: bool) -> Optio
         ),
         "commandExecution" => {
             let command = display_command(item);
-            let output = item
-                .get("aggregatedOutput")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let output = sanitize_terminal_output(
+                item.get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
             let status = if completed {
                 item.get("exitCode")
                     .and_then(Value::as_i64)
@@ -1674,11 +1787,12 @@ fn block_from_item(item: &Value, completed: bool, show_reasoning: bool) -> Optio
             } else {
                 "running…".to_string()
             };
-            let text = if output.is_empty() {
+            let mut text = if output.is_empty() {
                 status
             } else {
                 format!("{status}\n{output}")
             };
+            truncate_command_output(&mut text);
             TranscriptBlock::new(BlockKind::Command, format!("$ {command}"), text)
         }
         "fileChange" => {
@@ -1723,6 +1837,61 @@ fn block_from_item(item: &Value, completed: bool, show_reasoning: bool) -> Optio
     Some(block)
 }
 
+fn sanitize_terminal_output(input: &str) -> String {
+    let mut output = String::with_capacity(input.len().min(MAX_COMMAND_OUTPUT_BYTES));
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for candidate in chars.by_ref() {
+                        if ('@'..='~').contains(&candidate) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(candidate) = chars.next() {
+                        if candidate == '\u{7}' {
+                            break;
+                        }
+                        if candidate == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        if ch == '\r' {
+            if chars.peek() != Some(&'\n') {
+                output.push('\n');
+            }
+        } else if ch == '\n' || ch == '\t' || !ch.is_control() {
+            output.push(ch);
+        }
+        if output.len() > MAX_COMMAND_OUTPUT_BYTES {
+            truncate_command_output(&mut output);
+            break;
+        }
+    }
+    output
+}
+
+fn truncate_command_output(output: &mut String) {
+    if output.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return;
+    }
+    let mut end = MAX_COMMAND_OUTPUT_BYTES;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str(COMMAND_OUTPUT_TRUNCATED);
+}
+
 fn turn_input(text: &str, images: &[ImageAttachment]) -> Vec<Value> {
     let mut input = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
     if !text.is_empty() {
@@ -1737,26 +1906,104 @@ fn turn_input(text: &str, images: &[ImageAttachment]) -> Vec<Value> {
 }
 
 fn user_input_display(text: &str, images: &[ImageAttachment]) -> String {
-    let mut parts = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+    let mut parts = Vec::with_capacity(2);
     if !text.is_empty() {
         parts.push(text.to_string());
     }
-    parts.extend(images.iter().map(|_| "[image]".to_string()));
+    if !images.is_empty() {
+        parts.push(image_labels(images.len()));
+    }
     parts.join("\n")
 }
 
 fn user_message_display(content: Option<&Value>) -> String {
-    content
+    let mut parts = Vec::new();
+    let mut image_count = 0;
+    for part in content.and_then(Value::as_array).into_iter().flatten() {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            Some("localImage" | "image") => image_count += 1,
+            _ => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    if image_count > 0 {
+        parts.push(image_labels(image_count));
+    }
+    parts.join("\n")
+}
+
+fn user_message_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+        return None;
+    }
+    let text = item
+        .get("content")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => part.get("text").and_then(Value::as_str).map(str::to_owned),
-            Some("localImage" | "image") => Some("[image]".to_string()),
-            _ => part.get("text").and_then(Value::as_str).map(str::to_owned),
-        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn image_labels(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("[Image {index}]"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn thread_list_params(cwd: &str) -> Value {
+    json!({
+        "cwd": cwd,
+        "limit": 50,
+        "sortKey": "updated_at",
+        "sortDirection": "desc"
+    })
+}
+
+fn thread_summaries_from_response(result: &Value) -> Vec<ThreadSummary> {
+    result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|thread| {
+            Some(ThreadSummary {
+                id: thread.get("id")?.as_str()?.to_string(),
+                title: thread
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| thread.get("preview").and_then(Value::as_str))
+                    .unwrap_or("Untitled conversation")
+                    .lines()
+                    .next()
+                    .unwrap_or("Untitled conversation")
+                    .to_string(),
+                cwd: thread
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                updated_at: thread
+                    .get("updatedAt")
+                    .or_else(|| thread.get("createdAt"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 fn encode_clipboard_image(width: usize, height: usize, rgba: &[u8]) -> Result<ImageAttachment> {
@@ -1987,21 +2234,43 @@ mod tests {
             "type": "userMessage",
             "content": [
                 {"type": "text", "text": "what is this?"},
-                {"type": "image", "url": "data:image/png;base64,very-long-data"}
+                {"type": "image", "url": "data:image/png;base64,one"},
+                {"type": "image", "url": "data:image/png;base64,two"}
             ]
         });
         let block = block_from_item(&item, true, true).unwrap();
-        assert_eq!(block.text, "what is this?\n[image]");
+        assert_eq!(block.text, "what is this?\n[Image 1] [Image 2]");
+        assert_eq!(user_message_text(&item).as_deref(), Some("what is this?"));
 
         let optimistic = user_input_display(
             "what is this?",
-            &[ImageAttachment {
-                data_url: "data:image/png;base64,very-long-data".into(),
-                width: 640,
-                height: 480,
-            }],
+            &[
+                ImageAttachment {
+                    data_url: "data:image/png;base64,one".into(),
+                    width: 640,
+                    height: 480,
+                },
+                ImageAttachment {
+                    data_url: "data:image/png;base64,two".into(),
+                    width: 320,
+                    height: 240,
+                },
+            ],
         );
         assert_eq!(optimistic, block.text);
+    }
+
+    #[test]
+    fn thread_list_is_scoped_to_the_current_directory() {
+        assert_eq!(
+            thread_list_params("/work/magdex"),
+            json!({
+                "cwd": "/work/magdex",
+                "limit": 50,
+                "sortKey": "updated_at",
+                "sortDirection": "desc"
+            })
+        );
     }
 
     #[test]
@@ -2157,6 +2426,19 @@ mod tests {
             ),
             r#"printf '%s\n' '{"id":1}' | codex app-server"#
         );
+    }
+
+    #[test]
+    fn terminal_output_is_sanitized_and_bounded() {
+        assert_eq!(
+            sanitize_terminal_output("\u{1b}[?1049hhello\u{1b}[0m\rworld\u{1b}]0;title\u{7}\u{0}"),
+            "hello\nworld"
+        );
+
+        let mut output = "x".repeat(MAX_COMMAND_OUTPUT_BYTES + 10);
+        truncate_command_output(&mut output);
+        assert!(output.ends_with(COMMAND_OUTPUT_TRUNCATED));
+        assert!(output.len() <= MAX_COMMAND_OUTPUT_BYTES + COMMAND_OUTPUT_TRUNCATED.len());
     }
 
     #[test]

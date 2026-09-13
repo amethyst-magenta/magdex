@@ -22,6 +22,10 @@ const USER_BACKGROUND: Color = Color::Rgb(48, 48, 48);
 const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 38, 38);
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
+    if state.resume_picker.is_some() {
+        draw_resume_workspace(frame, state);
+        return;
+    }
     let area = frame.area();
     // The composer has two cells of horizontal padding on each side and a
     // two-cell prompt (`› `), so wrap against its real text width.
@@ -60,6 +64,96 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     }
 }
 
+fn draw_resume_workspace(frame: &mut Frame, state: &AppState) {
+    let area = frame.area();
+    let panel_gap = u16::from(state.popup.is_some() && area.height > 4);
+    let panel_height = state
+        .popup
+        .as_ref()
+        .map(|popup| bottom_panel_height(state, popup, area.width))
+        .unwrap_or(0)
+        .min(area.height.saturating_sub(3 + panel_gap));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(panel_gap),
+            Constraint::Length(panel_height),
+        ])
+        .split(area);
+
+    draw_header(frame, state, chunks[0]);
+    draw_resume_picker(frame, state, chunks[1]);
+    if let Some(popup) = &state.popup {
+        draw_bottom_panel(frame, state, popup.clone(), chunks[3]);
+    }
+}
+
+fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
+    let Some(picker) = state.resume_picker.as_ref() else {
+        return;
+    };
+    let block = Block::default().padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("Recent conversations", Style::default().bold()),
+            Line::styled(state.cwd.clone(), Style::default().fg(DIM)),
+        ]),
+        chunks[0],
+    );
+
+    let entries = if picker.loading {
+        vec![ListItem::new("Loading conversations…")]
+    } else if let Some(error) = &picker.error {
+        vec![ListItem::new(Line::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))]
+    } else if state.threads.is_empty() {
+        vec![ListItem::new("No conversations found in this directory")]
+    } else {
+        let title_width = chunks[1].width.saturating_sub(16).max(12) as usize;
+        state
+            .threads
+            .iter()
+            .map(|thread| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(truncate(&thread.title, title_width)),
+                    Span::styled(
+                        format!("  · {}", relative_time(thread.updated_at)),
+                        Style::default().fg(DIM),
+                    ),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(entries)
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().fg(ACCENT).bold());
+    let selection = (!picker.loading && picker.error.is_none() && !state.threads.is_empty())
+        .then_some(picker.selected);
+    let mut list_state = ListState::default().with_selected(selection);
+    frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new("j/k or ↑/↓ move · Enter resume · Ctrl+C quit")
+            .style(Style::default().fg(DIM)),
+        chunks[2],
+    );
+}
+
 fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
     let right = [
         state.model.as_deref().unwrap_or("default"),
@@ -91,10 +185,65 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    // Very long prose becomes hard to scan on ultrawide terminals. Keep the
-    // transcript at a reading width while leaving the composer full-width.
-    let content_width = area.width.saturating_sub(4).clamp(1, 120);
-    let render_width = area.width.max(1);
+    rebuild_transcript_cache(state, area.width);
+
+    let mut tail = Vec::with_capacity(3);
+    if let Some(started) = state.turn_started_at {
+        tail.push(working_indicator(started));
+        tail.push(Line::default());
+    }
+    if state.new_output {
+        tail.push(Line::from(Span::styled(
+            "  ↓ new output · End to follow",
+            Style::default().fg(ACCENT),
+        )));
+    }
+    let visual_height = state.transcript_cache_lines.len() + tail.len();
+    let max_scroll = visual_height.saturating_sub(area.height as usize);
+    state.transcript_max_scroll = max_scroll;
+    if state.scroll == usize::MAX || state.scroll >= max_scroll {
+        state.scroll = max_scroll;
+        state.at_bottom = true;
+        state.new_output = false;
+    }
+    let scroll = state.scroll;
+    let visible_end = (scroll + area.height as usize).min(visual_height);
+    let lines = (scroll..visible_end)
+        .map(|index| {
+            if index < state.transcript_cache_lines.len() {
+                state.transcript_cache_lines[index].clone()
+            } else {
+                tail[index - state.transcript_cache_lines.len()].clone()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (viewport_row, line) in lines.iter().enumerate() {
+        if line.style.bg != Some(USER_BACKGROUND) {
+            continue;
+        }
+        frame.render_widget(
+            Block::default().style(Style::default().bg(USER_BACKGROUND)),
+            Rect::new(
+                area.x,
+                area.y.saturating_add(viewport_row as u16),
+                area.width,
+                1,
+            ),
+        );
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
+    if state.transcript_cache_width == width
+        && state.transcript_cache_revision == state.transcript_revision
+    {
+        return;
+    }
+
+    let content_width = width.saturating_sub(4).max(1);
+    let render_width = width.max(1);
     let mut lines = Vec::new();
     let mut in_activity = false;
     for block in &state.blocks {
@@ -134,48 +283,9 @@ fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
         lines.push(section_separator(render_width as usize));
         lines.push(Line::default());
     }
-    if let Some(started) = state.turn_started_at {
-        lines.push(working_indicator(started));
-        lines.push(Line::default());
-    }
-    if state.new_output {
-        lines.push(Line::from(Span::styled(
-            "  ↓ new output · End to follow",
-            Style::default().fg(ACCENT),
-        )));
-    }
-    // Every transcript line is wrapped explicitly before rendering. Keeping
-    // Paragraph's second wrapping pass enabled made full-width background and
-    // separator rows count as two lines, which hid the true bottom row.
-    let visual_height = lines.len();
-    let max_scroll = visual_height.saturating_sub(area.height as usize);
-    state.transcript_max_scroll = max_scroll;
-    if state.scroll == usize::MAX || state.scroll >= max_scroll {
-        state.scroll = max_scroll;
-        state.at_bottom = true;
-        state.new_output = false;
-    }
-    let scroll = state.scroll.min(u16::MAX as usize);
-    for (index, line) in lines.iter().enumerate() {
-        if line.style.bg != Some(USER_BACKGROUND) || index < scroll {
-            continue;
-        }
-        let viewport_row = index - scroll;
-        if viewport_row >= area.height as usize {
-            break;
-        }
-        frame.render_widget(
-            Block::default().style(Style::default().bg(USER_BACKGROUND)),
-            Rect::new(
-                area.x,
-                area.y.saturating_add(viewport_row as u16),
-                area.width,
-                1,
-            ),
-        );
-    }
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0));
-    frame.render_widget(paragraph, area);
+    state.transcript_cache_width = width;
+    state.transcript_cache_revision = state.transcript_revision;
+    state.transcript_cache_lines = lines;
 }
 
 fn append_block(
@@ -603,12 +713,35 @@ fn layout_composer(text: &str, cursor: usize, width: usize) -> ComposerLayout {
     let mut col = 0;
     let mut cursor_position = None;
 
+    let mut previous = None;
     for (index, ch) in text.char_indices() {
         let char_width = ch.width().unwrap_or(0);
+        let word_start = ch != '\n'
+            && !ch.is_whitespace()
+            && previous.is_none_or(|previous: char| previous.is_whitespace());
+        if word_start {
+            let word_width = text[index..]
+                .chars()
+                .take_while(|candidate| !candidate.is_whitespace())
+                .map(|candidate| candidate.width().unwrap_or(0))
+                .sum::<usize>();
+            if col > 0 && col + word_width > width {
+                row += 1;
+                col = 0;
+                lines.push(String::new());
+            }
+        }
         if ch != '\n' && col > 0 && col + char_width > width {
             row += 1;
             col = 0;
             lines.push(String::new());
+            if ch.is_whitespace() {
+                if index == cursor {
+                    cursor_position = Some((row, col));
+                }
+                previous = Some(ch);
+                continue;
+            }
         }
         if index == cursor {
             cursor_position = Some((row, col));
@@ -629,6 +762,7 @@ fn layout_composer(text: &str, cursor: usize, width: usize) -> ComposerLayout {
                 cursor_position = Some((row, col));
             }
         }
+        previous = Some(ch);
     }
     if cursor == text.len() && cursor_position.is_none() {
         if col >= width {
@@ -728,14 +862,16 @@ fn attachment_labels(images: &[ImageAttachment]) -> Vec<String> {
     if images.len() <= 3 {
         return images
             .iter()
-            .map(|image| format!("[image] {}x{}", image.width, image.height))
+            .enumerate()
+            .map(|(index, image)| format!("[Image {}] {}x{}", index + 1, image.width, image.height))
             .collect();
     }
     let mut labels = images[..2]
         .iter()
-        .map(|image| format!("[image] {}x{}", image.width, image.height))
+        .enumerate()
+        .map(|(index, image)| format!("[Image {}] {}x{}", index + 1, image.width, image.height))
         .collect::<Vec<_>>();
-    labels.push(format!("[image] +{} more", images.len() - 2));
+    labels.push(format!("[Images 3–{}]", images.len()));
     labels
 }
 
@@ -1328,6 +1464,35 @@ mod tests {
     }
 
     #[test]
+    fn transcript_scroll_is_not_limited_to_u16_rows() {
+        let backend = ratatui::backend::TestBackend::new(20, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        let mut rows = vec!["filler"; 69_999];
+        rows.push("target");
+        state.blocks = vec![TranscriptBlock::new(
+            BlockKind::Assistant,
+            "Codex",
+            rows.join("\n"),
+        )];
+        state.scroll = usize::MAX;
+
+        terminal
+            .draw(|frame| draw_transcript(frame, &mut state, frame.area()))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(state.transcript_max_scroll > u16::MAX as usize);
+        assert!(rendered.contains("target"));
+    }
+
+    #[test]
     fn composer_is_a_padded_full_width_panel() {
         let backend = ratatui::backend::TestBackend::new(40, 5);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1369,8 +1534,60 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("[image] 640x480"));
+        assert!(rendered.contains("[Image 1] 640x480"));
         assert!(rendered.contains("Ask Codex"));
+    }
+
+    #[test]
+    fn transcript_uses_the_full_terminal_width() {
+        let backend = ratatui::backend::TestBackend::new(180, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![TranscriptBlock::new(
+            BlockKind::Assistant,
+            "Codex",
+            "x".repeat(150),
+        )];
+
+        terminal
+            .draw(|frame| draw_transcript(frame, &mut state, frame.area()))
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(130, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn resume_picker_replaces_the_transcript_and_composer() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/work/magdex".into(), true);
+        state.resume_picker = Some(crate::model::ResumePicker {
+            selected: 0,
+            loading: false,
+            error: None,
+        });
+        state.threads = vec![crate::model::ThreadSummary {
+            id: "thread-1".into(),
+            title: "Fix transcript width".into(),
+            cwd: "/work/magdex".into(),
+            updated_at: 0,
+        }];
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Recent conversations"));
+        assert!(rendered.contains("Fix transcript width"));
+        assert!(rendered.contains("Ctrl+C quit"));
+        assert!(!rendered.contains("Esc quit"));
+        assert!(!rendered.contains("Connecting to app-server"));
+        assert!(!rendered.contains("Ask Codex"));
     }
 
     #[test]
@@ -1526,6 +1743,31 @@ mod tests {
         let layout = layout_composer("abcdefghij", 10, 4);
         assert_eq!(layout.lines, ["abcd", "efgh", "ij"]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (2, 2));
+    }
+
+    #[test]
+    fn composer_wraps_before_whole_words() {
+        let layout = layout_composer("hello world", "hello world".len(), 10);
+        assert_eq!(layout.lines, ["hello ", "world"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 5));
+
+        let exact = layout_composer("alpha beta gamma", "alpha beta gamma".len(), 10);
+        assert_eq!(exact.lines, ["alpha beta", "gamma"]);
+    }
+
+    #[test]
+    fn composer_does_not_split_russian_words_at_any_normal_width() {
+        let text = "так, сообщения растягиваются на весь экран, попробуй запустить магдекс или другое приложение и посмотрим";
+        for width in 20..=100 {
+            let layout = layout_composer(text, text.len(), width);
+            for word in text.split_whitespace() {
+                assert!(
+                    layout.lines.iter().any(|line| line.contains(word)),
+                    "{word:?} split at width {width}: {:?}",
+                    layout.lines
+                );
+            }
+        }
     }
 
     #[test]

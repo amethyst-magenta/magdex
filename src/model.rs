@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use ratatui::text::Line;
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default)]
@@ -59,6 +60,13 @@ pub struct ThreadSummary {
     pub title: String,
     pub cwd: String,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumePicker {
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,8 +251,16 @@ pub struct AppState {
     pub models: Vec<ModelInfo>,
     pub collaboration_modes: Vec<CollaborationModeInfo>,
     pub threads: Vec<ThreadSummary>,
+    pub resume_picker: Option<ResumePicker>,
     pub blocks: Vec<TranscriptBlock>,
+    pub transcript_revision: u64,
+    pub transcript_cache_width: u16,
+    pub transcript_cache_revision: u64,
+    pub transcript_cache_lines: Vec<Line<'static>>,
     pub composer: Composer,
+    pub message_history: Vec<String>,
+    pub message_history_position: Option<usize>,
+    pub message_history_draft: String,
     pub image_attachments: Vec<ImageAttachment>,
     pub popup: Option<Popup>,
     pub pending_server_requests: VecDeque<ServerPrompt>,
@@ -308,12 +324,20 @@ impl AppState {
                 },
             ],
             threads: vec![],
+            resume_picker: None,
             blocks: vec![TranscriptBlock::new(
                 BlockKind::Status,
                 "Codex",
                 "Connecting to app-server…",
             )],
+            transcript_revision: 1,
+            transcript_cache_width: 0,
+            transcript_cache_revision: 0,
+            transcript_cache_lines: vec![],
             composer: Composer::default(),
+            message_history: vec![],
+            message_history_position: None,
+            message_history_draft: String::new(),
             image_attachments: vec![],
             popup: None,
             pending_server_requests: VecDeque::new(),
@@ -327,8 +351,59 @@ impl AppState {
         }
     }
 
+    pub fn remember_message(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if !text.is_empty() {
+            self.message_history.push(text);
+        }
+        self.message_history_position = None;
+        self.message_history_draft.clear();
+    }
+
+    pub fn clear_message_history(&mut self) {
+        self.message_history.clear();
+        self.message_history_position = None;
+        self.message_history_draft.clear();
+    }
+
+    pub fn previous_message(&mut self) {
+        if self.message_history.is_empty() {
+            return;
+        }
+        let position = match self.message_history_position {
+            Some(position) => position.saturating_sub(1),
+            None => {
+                self.message_history_draft = self.composer.text.clone();
+                self.message_history.len() - 1
+            }
+        };
+        self.message_history_position = Some(position);
+        self.set_composer(self.message_history[position].clone());
+    }
+
+    pub fn next_message(&mut self) {
+        let Some(position) = self.message_history_position else {
+            return;
+        };
+        if position + 1 < self.message_history.len() {
+            let next = position + 1;
+            self.message_history_position = Some(next);
+            self.set_composer(self.message_history[next].clone());
+        } else {
+            self.message_history_position = None;
+            let draft = std::mem::take(&mut self.message_history_draft);
+            self.set_composer(draft);
+        }
+    }
+
+    fn set_composer(&mut self, text: String) {
+        self.composer.text = text;
+        self.composer.cursor = self.composer.text.len();
+    }
+
     pub fn push(&mut self, block: TranscriptBlock) {
         self.blocks.push(block);
+        self.mark_transcript_dirty();
         if self.at_bottom {
             self.scroll = usize::MAX;
         } else {
@@ -345,6 +420,7 @@ impl AppState {
             let expanded = existing.expanded;
             *existing = block;
             existing.expanded = expanded;
+            self.mark_transcript_dirty();
             if self.at_bottom {
                 self.scroll = usize::MAX;
             } else {
@@ -362,6 +438,7 @@ impl AppState {
             .find(|candidate| candidate.id.as_deref() == Some(id))
         {
             block.text.push_str(delta);
+            self.mark_transcript_dirty();
         } else {
             let mut block = TranscriptBlock::new(kind, title, delta);
             block.id = Some(id.to_string());
@@ -372,6 +449,15 @@ impl AppState {
         } else {
             self.new_output = true;
         }
+    }
+
+    pub fn clear_blocks(&mut self) {
+        self.blocks.clear();
+        self.mark_transcript_dirty();
+    }
+
+    pub fn mark_transcript_dirty(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
     pub fn present_server_prompt(&mut self, prompt: ServerPrompt) {
@@ -448,5 +534,23 @@ mod tests {
 
         assert_eq!(state.blocks[0].text, "first second");
         assert_eq!(state.scroll, usize::MAX);
+    }
+
+    #[test]
+    fn message_history_recalls_messages_and_restores_the_draft() {
+        let mut state = AppState::new("/project".into(), true);
+        state.remember_message("first");
+        state.remember_message("second");
+        state.composer.insert_str("draft");
+
+        state.previous_message();
+        assert_eq!(state.composer.text, "second");
+        state.previous_message();
+        assert_eq!(state.composer.text, "first");
+        state.next_message();
+        assert_eq!(state.composer.text, "second");
+        state.next_message();
+        assert_eq!(state.composer.text, "draft");
+        assert_eq!(state.composer.cursor, state.composer.text.len());
     }
 }
