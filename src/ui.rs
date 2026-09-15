@@ -1331,7 +1331,8 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
         }
         Popup::TrustDirectory(prompt) => {
             let detail = trust_directory_detail(prompt);
-            (visual_line_count(&detail, width) as u16 + 5).clamp(10, 20)
+            let option_count = if prompt.saving { 1 } else { 2 };
+            (visual_line_count(&detail, width) as u16 + option_count + 3).clamp(7, 20)
         }
         Popup::Approval(approval) => {
             let option_count = approval_options(&approval.kind).len();
@@ -1476,7 +1477,7 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 &trust_directory_detail(&prompt),
                 options,
                 prompt.selected.min(options.len().saturating_sub(1)),
-                0,
+                1,
                 area,
             );
         }
@@ -2505,6 +2506,34 @@ mod tests {
         assert!(rendered.contains("project root: /work/project"));
         assert!(rendered.contains("Yes, continue"));
         assert!(rendered.contains("No, quit"));
+    }
+
+    #[test]
+    fn trust_prompt_keeps_answers_close_and_has_bottom_padding() {
+        let backend = ratatui::backend::TestBackend::new(160, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/work/project".into(), true);
+        state.popup = Some(Popup::TrustDirectory(TrustDirectoryPrompt {
+            cwd: "/work/project".into(),
+            trust_target: "/work/project".into(),
+            selected: 0,
+            saving: false,
+            error: None,
+        }));
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(14).contains("Do you trust"));
+        assert!(row(15).contains("Yes, continue"));
+        assert!(row(16).contains("No, quit"));
+        assert!(row(17).trim().is_empty());
+        assert_eq!(buffer[(0, 17)].bg, COMPOSER_BACKGROUND);
     }
 
     #[test]

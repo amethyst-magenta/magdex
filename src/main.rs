@@ -69,13 +69,16 @@ async fn main() -> Result<()> {
     let mut rpc_open = true;
     let mut dirty = true;
     let mut full_redraw = false;
+    let zellij_redraw_workaround = running_in_zellij();
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(33));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = redraw.tick(), if dirty => {
                 if full_redraw {
-                    guard.terminal.clear()?;
+                    // Invalidate Ratatui's previous frame without clearing the
+                    // physical terminal. A real clear briefly blanks Zellij.
+                    guard.terminal.swap_buffers();
                     full_redraw = false;
                 }
                 guard
@@ -90,7 +93,10 @@ async fn main() -> Result<()> {
                 });
                 let full_redraw_after_event = event.as_ref().is_some_and(|event| {
                     event.as_ref().is_ok_and(|event| {
-                        event_requests_full_redraw(event, config.mouse)
+                        event_requests_full_redraw(
+                            event,
+                            zellij_redraw_workaround,
+                        )
                     })
                 });
                 match event {
@@ -190,25 +196,25 @@ fn event_requests_redraw(event: &Event, mouse: bool) -> bool {
     }
 }
 
-fn event_requests_full_redraw(event: &Event, mouse: bool) -> bool {
+fn event_requests_full_redraw(event: &Event, zellij_workaround: bool) -> bool {
     match event {
         Event::Key(key)
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                 && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             let key = normalize_control_shortcut(*key);
-            matches!(key.code, KeyCode::Char('k' | 'j' | 'g' | 'o'))
+            zellij_workaround && matches!(key.code, KeyCode::Char('k' | 'j' | 'g' | 'o'))
         }
-        Event::Mouse(mouse_event) => {
-            mouse
-                && matches!(
-                    mouse_event.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                )
-        }
+        // Wheel input arrives in bursts. Repainting the entire screen for each
+        // event overloads multiplexers and is unnecessary for plain scrolling.
+        Event::Mouse(_) => false,
         Event::Resize(_, _) => true,
         _ => false,
     }
+}
+
+fn running_in_zellij() -> bool {
+    std::env::var_os("ZELLIJ").is_some() || std::env::var_os("ZELLIJ_SESSION_NAME").is_some()
 }
 
 fn print_help() {
@@ -276,7 +282,7 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
     use super::{event_requests_full_redraw, next_working_redraw, WORKING_FRAME_MILLIS};
 
@@ -293,18 +299,27 @@ mod tests {
     }
 
     #[test]
-    fn transcript_structure_changes_request_a_full_redraw() {
+    fn zellij_transcript_workaround_requests_a_full_redraw() {
         for code in ['k', 'j', 'g', 'o'] {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
-            assert!(event_requests_full_redraw(&event, false));
+            assert!(event_requests_full_redraw(&event, true));
+            assert!(!event_requests_full_redraw(&event, false));
         }
         for code in ['л', 'о', 'п', 'щ'] {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
-            assert!(event_requests_full_redraw(&event, false));
+            assert!(event_requests_full_redraw(&event, true));
+            assert!(!event_requests_full_redraw(&event, false));
         }
 
         let plain_key = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert!(!event_requests_full_redraw(&plain_key, false));
+        assert!(!event_requests_full_redraw(&plain_key, true));
+        let wheel = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!event_requests_full_redraw(&wheel, true));
         assert!(event_requests_full_redraw(&Event::Resize(120, 40), false));
     }
 }
