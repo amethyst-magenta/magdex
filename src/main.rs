@@ -10,7 +10,8 @@ use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, EventStream,
-        KeyCode, KeyEventKind, MouseEventKind,
+        KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -19,7 +20,7 @@ use crossterm::{
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use app::Controller;
+use app::{normalize_control_shortcut, Controller};
 use config::ClientConfig;
 
 const WORKING_FRAME_MILLIS: u64 = 50;
@@ -67,11 +68,16 @@ async fn main() -> Result<()> {
     let mut events = EventStream::new();
     let mut rpc_open = true;
     let mut dirty = true;
+    let mut full_redraw = false;
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(33));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = redraw.tick(), if dirty => {
+                if full_redraw {
+                    guard.terminal.clear()?;
+                    full_redraw = false;
+                }
                 guard
                     .terminal
                     .draw(|frame| ui::draw(frame, &mut controller.state))?;
@@ -81,6 +87,11 @@ async fn main() -> Result<()> {
             event = events.next() => {
                 let redraw_after_event = event.as_ref().is_some_and(|event| {
                     event.as_ref().is_ok_and(|event| event_requests_redraw(event, config.mouse))
+                });
+                let full_redraw_after_event = event.as_ref().is_some_and(|event| {
+                    event.as_ref().is_ok_and(|event| {
+                        event_requests_full_redraw(event, config.mouse)
+                    })
                 });
                 match event {
                     Some(Ok(Event::Key(key)))
@@ -113,6 +124,9 @@ async fn main() -> Result<()> {
                 }
                 if redraw_after_event {
                     dirty = true;
+                }
+                if full_redraw_after_event {
+                    full_redraw = true;
                 }
             }
             incoming = controller.next_rpc(), if rpc_open => {
@@ -176,9 +190,30 @@ fn event_requests_redraw(event: &Event, mouse: bool) -> bool {
     }
 }
 
+fn event_requests_full_redraw(event: &Event, mouse: bool) -> bool {
+    match event {
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            let key = normalize_control_shortcut(*key);
+            matches!(key.code, KeyCode::Char('k' | 'j' | 'g' | 'o'))
+        }
+        Event::Mouse(mouse_event) => {
+            mouse
+                && matches!(
+                    mouse_event.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+        }
+        Event::Resize(_, _) => true,
+        _ => false,
+    }
+}
+
 fn print_help() {
     println!(
-        "magdex {}\n\nMagdex — minimal TUI for Codex App Server\n\nUsage: magdex [--debug] [resume]\n\nCommands:\n  resume    Choose a recent conversation from the current directory\n\nOptions:\n  --debug   Record JSON-RPC traffic\n  -h, --help\n  -V, --version",
+        "magdex {}\n\nMagdex — minimal TUI for Codex App Server\n\nUsage: magdex [--debug] [resume]\n\nCommands:\n  resume    Choose a recent conversation (Tab switches directory scope)\n\nOptions:\n  --debug   Record JSON-RPC traffic\n  -h, --help\n  -V, --version",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -193,13 +228,19 @@ impl TerminalGuard {
     fn enter(mouse: bool) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableBracketedPaste
+        )?;
         if mouse {
             // Normal tracking reports clicks and wheel events without the
             // pointer-motion events enabled by Crossterm's broad preset.
             execute!(stdout, Print("\x1b[?1000h\x1b[?1006h"))?;
         }
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        terminal.clear()?;
         Ok(Self {
             terminal,
             mouse,
@@ -218,6 +259,7 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen
         )?;
         self.terminal.show_cursor()?;
@@ -234,7 +276,9 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_working_redraw, WORKING_FRAME_MILLIS};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{event_requests_full_redraw, next_working_redraw, WORKING_FRAME_MILLIS};
 
     #[test]
     fn working_redraw_aligns_with_turn_frames() {
@@ -246,5 +290,21 @@ mod tests {
             std::time::Duration::from_millis(25)
         );
         assert_eq!(1_000 % WORKING_FRAME_MILLIS, 0);
+    }
+
+    #[test]
+    fn transcript_structure_changes_request_a_full_redraw() {
+        for code in ['k', 'j', 'g', 'o'] {
+            let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
+            assert!(event_requests_full_redraw(&event, false));
+        }
+        for code in ['л', 'о', 'п', 'щ'] {
+            let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
+            assert!(event_requests_full_redraw(&event, false));
+        }
+
+        let plain_key = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(!event_requests_full_redraw(&plain_key, false));
+        assert!(event_requests_full_redraw(&Event::Resize(120, 40), false));
     }
 }

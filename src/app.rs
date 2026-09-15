@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{ensure, Result};
 use arboard::Clipboard;
@@ -10,8 +10,8 @@ use crate::{
     model::{
         ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
         CommandAction, CommandActionKind, FileChange, FileChangeKind, ImageAttachment, ModelInfo,
-        Popup, ResumePicker, ServerPrompt, ThreadSummary, TranscriptBlock, UserInputOption,
-        UserInputQuestion, UserInputRequest,
+        Popup, ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
+        TrustDirectoryPrompt, UserInputOption, UserInputQuestion, UserInputRequest,
     },
     rpc::{Incoming, RpcClient},
 };
@@ -36,10 +36,18 @@ enum Pending {
     Models,
     CollaborationModes,
     Config,
+    TrustProject {
+        trust_target: String,
+    },
     StartThread,
-    ListThreads(ThreadListTarget),
+    ListThreads {
+        target: ThreadListTarget,
+        scope: ResumeScope,
+    },
     ResumeThread(ResumeTarget),
-    ThreadTurns { thread_id: String },
+    ThreadTurns {
+        thread_id: String,
+    },
     StartTurn,
     UpdateMode,
     Interrupt,
@@ -63,6 +71,7 @@ pub struct Controller {
     pending: HashMap<u64, Pending>,
     default_mode_request_user_input: bool,
     debug: bool,
+    startup_resume_pending: bool,
 }
 
 impl Controller {
@@ -74,20 +83,14 @@ impl Controller {
         resume_on_start: bool,
     ) -> Result<Self> {
         let rpc = RpcClient::spawn(debug, default_mode_request_user_input).await?;
-        let mut state = AppState::new(cwd, show_reasoning);
-        if resume_on_start {
-            state.resume_picker = Some(ResumePicker {
-                selected: 0,
-                loading: true,
-                error: None,
-            });
-        }
+        let state = AppState::new(cwd, show_reasoning);
         let mut this = Self {
             state,
             rpc,
             pending: HashMap::new(),
             default_mode_request_user_input,
             debug,
+            startup_resume_pending: resume_on_start,
         };
         this.initialize()?;
         Ok(this)
@@ -158,18 +161,8 @@ impl Controller {
                 detail.clone(),
             ));
             match pending {
-                Pending::ListThreads(ThreadListTarget::Popup) => {
-                    self.state.popup = Some(Popup::Resume {
-                        selected: 0,
-                        loading: false,
-                    });
-                }
-                Pending::ListThreads(ThreadListTarget::Picker) => {
-                    self.state.resume_picker = Some(ResumePicker {
-                        selected: 0,
-                        loading: false,
-                        error: Some(detail),
-                    });
+                Pending::ListThreads { target, scope } => {
+                    self.apply_thread_list_error(target, scope, detail);
                 }
                 Pending::ResumeThread(ResumeTarget::Popup) | Pending::ThreadTurns { .. } => {
                     self.state.popup = None;
@@ -196,6 +189,20 @@ impl Controller {
                         error: Some(detail),
                     });
                 }
+                Pending::Config => {
+                    self.state.popup = Some(Popup::Disconnected {
+                        reason: format!("Could not read Codex configuration: {detail}"),
+                        selected: 0,
+                    });
+                }
+                Pending::TrustProject { trust_target } => {
+                    if let Some(Popup::TrustDirectory(prompt)) = self.state.popup.as_mut() {
+                        if prompt.trust_target == trust_target {
+                            prompt.saving = false;
+                            prompt.error = Some(detail);
+                        }
+                    }
+                }
                 _ => {}
             }
             return Ok(());
@@ -215,14 +222,26 @@ impl Controller {
             }
             Pending::Config => {
                 self.apply_config(&result);
-                Ok(())
+                if let Some(trust_target) = trust_target_from_config(&result, &self.state.cwd) {
+                    self.state.popup = Some(Popup::TrustDirectory(TrustDirectoryPrompt {
+                        cwd: self.state.cwd.clone(),
+                        trust_target,
+                        selected: 0,
+                        saving: false,
+                        error: None,
+                    }));
+                    Ok(())
+                } else {
+                    self.finish_startup()
+                }
             }
+            Pending::TrustProject { .. } => self.request_config(),
             Pending::StartThread => {
                 self.load_thread_response(&result, false);
                 Ok(())
             }
-            Pending::ListThreads(target) => {
-                self.apply_thread_list(&result, target);
+            Pending::ListThreads { target, scope } => {
+                self.apply_thread_list(&result, target, scope);
                 Ok(())
             }
             Pending::ResumeThread(_) => {
@@ -264,16 +283,51 @@ impl Controller {
         self.pending.insert(models, Pending::Models);
         let modes = self.rpc.request("collaborationMode/list", json!({}))?;
         self.pending.insert(modes, Pending::CollaborationModes);
+        self.request_config()
+    }
+
+    fn request_config(&mut self) -> Result<()> {
         let config = self.rpc.request(
             "config/read",
-            json!({"cwd": self.state.cwd, "includeLayers": false}),
+            json!({"cwd": self.state.cwd, "includeLayers": true}),
         )?;
         self.pending.insert(config, Pending::Config);
-        if self.state.resume_picker.is_some() {
-            self.request_threads_for(ThreadListTarget::Picker)?;
+        Ok(())
+    }
+
+    fn finish_startup(&mut self) -> Result<()> {
+        if matches!(self.state.popup, Some(Popup::TrustDirectory(_))) {
+            self.state.popup = None;
+        }
+        if std::mem::take(&mut self.startup_resume_pending) {
+            self.state.resume_picker = Some(ResumePicker {
+                selected: 0,
+                loading: true,
+                error: None,
+                scope: ResumeScope::CurrentDirectory,
+            });
+            self.request_threads_for(ThreadListTarget::Picker, ResumeScope::CurrentDirectory)?;
         } else {
             self.start_thread()?;
         }
+        Ok(())
+    }
+
+    fn trust_project(&mut self) -> Result<()> {
+        let Some(Popup::TrustDirectory(prompt)) = self.state.popup.as_mut() else {
+            return Ok(());
+        };
+        if prompt.saving {
+            return Ok(());
+        }
+        let trust_target = prompt.trust_target.clone();
+        prompt.saving = true;
+        prompt.error = None;
+        let id = self
+            .rpc
+            .request("config/batchWrite", trust_write_params(&trust_target))?;
+        self.pending
+            .insert(id, Pending::TrustProject { trust_target });
         Ok(())
     }
 
@@ -378,13 +432,13 @@ impl Controller {
 
     fn apply_config(&mut self, result: &Value) {
         let config = result.get("config").unwrap_or(result);
-        if self.state.model.is_none() {
+        if !self.state.explicit_model {
             self.state.model = config
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
-        if self.state.effort.is_none() {
+        if !self.state.explicit_effort {
             self.state.effort = config
                 .get("modelReasoningEffort")
                 .or_else(|| config.get("model_reasoning_effort"))
@@ -464,16 +518,17 @@ impl Controller {
     }
 
     fn request_threads(&mut self) -> Result<()> {
-        self.request_threads_for(ThreadListTarget::Popup)
+        self.request_threads_for(ThreadListTarget::Popup, ResumeScope::CurrentDirectory)
     }
 
-    fn request_threads_for(&mut self, target: ThreadListTarget) -> Result<()> {
+    fn request_threads_for(&mut self, target: ThreadListTarget, scope: ResumeScope) -> Result<()> {
         self.state.threads.clear();
         match target {
             ThreadListTarget::Popup => {
                 self.state.popup = Some(Popup::Resume {
                     selected: 0,
                     loading: true,
+                    scope,
                 });
             }
             ThreadListTarget::Picker => {
@@ -481,23 +536,69 @@ impl Controller {
                     selected: 0,
                     loading: true,
                     error: None,
+                    scope,
                 });
             }
         }
         let id = self
             .rpc
-            .request("thread/list", thread_list_params(&self.state.cwd))?;
-        self.pending.insert(id, Pending::ListThreads(target));
+            .request("thread/list", thread_list_params(&self.state.cwd, scope))?;
+        self.pending
+            .insert(id, Pending::ListThreads { target, scope });
         Ok(())
     }
 
-    fn apply_thread_list(&mut self, result: &Value, target: ThreadListTarget) {
+    fn active_thread_list_scope(&self, target: ThreadListTarget) -> Option<ResumeScope> {
+        match target {
+            ThreadListTarget::Popup => match self.state.popup.as_ref() {
+                Some(Popup::Resume { scope, .. }) => Some(*scope),
+                _ => None,
+            },
+            ThreadListTarget::Picker => {
+                self.state.resume_picker.as_ref().map(|picker| picker.scope)
+            }
+        }
+    }
+
+    fn apply_thread_list_error(
+        &mut self,
+        target: ThreadListTarget,
+        scope: ResumeScope,
+        detail: String,
+    ) {
+        if self.active_thread_list_scope(target) != Some(scope) {
+            return;
+        }
+        match target {
+            ThreadListTarget::Popup => {
+                self.state.popup = Some(Popup::Resume {
+                    selected: 0,
+                    loading: false,
+                    scope,
+                });
+            }
+            ThreadListTarget::Picker => {
+                self.state.resume_picker = Some(ResumePicker {
+                    selected: 0,
+                    loading: false,
+                    error: Some(detail),
+                    scope,
+                });
+            }
+        }
+    }
+
+    fn apply_thread_list(&mut self, result: &Value, target: ThreadListTarget, scope: ResumeScope) {
+        if self.active_thread_list_scope(target) != Some(scope) {
+            return;
+        }
         self.state.threads = thread_summaries_from_response(result);
         match target {
             ThreadListTarget::Popup => {
                 self.state.popup = Some(Popup::Resume {
                     selected: 0,
                     loading: false,
+                    scope,
                 });
             }
             ThreadListTarget::Picker => {
@@ -505,6 +606,7 @@ impl Controller {
                     selected: 0,
                     loading: false,
                     error: None,
+                    scope,
                 });
             }
         }
@@ -516,12 +618,16 @@ impl Controller {
         };
         let id = self.rpc.request(
             "thread/resume",
-            json!({"threadId": thread.id, "excludeTurns": true}),
+            thread_resume_params(&thread.id, &self.state.cwd),
         )?;
-        let target = if self.state.resume_picker.is_some() {
-            ResumeTarget::Picker
+        let (target, scope) = if let Some(picker) = self.state.resume_picker.as_ref() {
+            (ResumeTarget::Picker, picker.scope)
         } else {
-            ResumeTarget::Popup
+            let scope = match self.state.popup.as_ref() {
+                Some(Popup::Resume { scope, .. }) => *scope,
+                _ => ResumeScope::CurrentDirectory,
+            };
+            (ResumeTarget::Popup, scope)
         };
         self.pending.insert(id, Pending::ResumeThread(target));
         match target {
@@ -529,6 +635,7 @@ impl Controller {
                 self.state.popup = Some(Popup::Resume {
                     selected: index,
                     loading: true,
+                    scope,
                 });
             }
             ResumeTarget::Picker => {
@@ -824,6 +931,13 @@ impl Controller {
         Ok(())
     }
 
+    fn toggle_collaboration_mode(&mut self) -> Result<()> {
+        let Some(selected) = alternate_collaboration_mode_index(&self.state) else {
+            return Ok(());
+        };
+        self.select_collaboration_mode(selected)
+    }
+
     fn supported_efforts(&self) -> Vec<String> {
         self.state
             .model
@@ -870,6 +984,7 @@ impl Controller {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let key = normalize_control_shortcut(key);
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.state.turn_id.is_some() {
                 return self.interrupt();
@@ -907,38 +1022,15 @@ impl Controller {
                 KeyCode::Char('k') => self.scroll_up(3),
                 KeyCode::Char('j') => self.scroll_down(3),
                 KeyCode::Char('g') => self.state.jump_to_bottom(),
-                KeyCode::Char('o') => {
-                    let toggled = if let Some(block) =
-                        self.state.blocks.iter_mut().rev().find(|block| {
-                            matches!(
-                                block.kind,
-                                BlockKind::Command | BlockKind::File | BlockKind::Web
-                            )
-                        }) {
-                        if block.kind == BlockKind::Command {
-                            block.expanded = !block.expanded;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if toggled {
-                        self.state.mark_transcript_dirty();
-                    }
-                }
-                KeyCode::Char('a') => self.state.composer.move_to_line_start(),
-                KeyCode::Char('e') => self.state.composer.move_to_line_end(),
+                KeyCode::Char('o') => toggle_latest_command(&mut self.state),
                 _ => {}
             }
             return Ok(());
         }
 
         match key.code {
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.state.composer.newline()
-            }
+            KeyCode::Tab => self.toggle_collaboration_mode()?,
+            KeyCode::Enter if is_newline_key(key) => self.state.composer.newline(),
             KeyCode::Enter => self.send_composer()?,
             KeyCode::Char(ch) => self.state.composer.insert(ch),
             KeyCode::Backspace => self.state.composer.backspace(),
@@ -953,11 +1045,15 @@ impl Controller {
     }
 
     fn handle_resume_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let key = normalize_list_navigation(key);
         let Some(picker) = self.state.resume_picker.as_ref() else {
             return Ok(());
         };
         if picker.loading {
             return Ok(());
+        }
+        if key.code == KeyCode::Tab {
+            return self.request_threads_for(ThreadListTarget::Picker, picker.scope.toggled());
         }
         let selected = picker.selected;
         match key.code {
@@ -980,11 +1076,26 @@ impl Controller {
 
     fn handle_popup_key(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(Popup::Disconnected { selected, .. }) = self.state.popup.as_mut() {
+            let key = normalize_list_navigation(key);
             match key.code {
                 KeyCode::Char('k') => *selected = selected.saturating_sub(1),
                 KeyCode::Char('j') => *selected = (*selected + 1).min(1),
                 KeyCode::Enter if *selected == 1 => self.state.quit = true,
                 KeyCode::Esc => self.state.quit = true,
+                _ => {}
+            }
+            return Ok(());
+        }
+        if let Some(Popup::TrustDirectory(prompt)) = self.state.popup.as_mut() {
+            if prompt.saving {
+                return Ok(());
+            }
+            let key = normalize_list_navigation(key);
+            match key.code {
+                KeyCode::Char('k') | KeyCode::Up => prompt.selected = 0,
+                KeyCode::Char('j') | KeyCode::Down => prompt.selected = 1,
+                KeyCode::Enter if prompt.selected == 0 => return self.trust_project(),
+                KeyCode::Enter | KeyCode::Esc => self.state.quit = true,
                 _ => {}
             }
             return Ok(());
@@ -995,6 +1106,16 @@ impl Controller {
         if let Some(Popup::UserInput(_)) = &self.state.popup {
             return self.handle_user_input_key(key);
         }
+        if key.code == KeyCode::Tab {
+            if let Some(Popup::Resume {
+                scope,
+                loading: false,
+                ..
+            }) = self.state.popup.as_ref()
+            {
+                return self.request_threads_for(ThreadListTarget::Popup, scope.toggled());
+            }
+        }
         if key.code == KeyCode::Esc {
             if matches!(self.state.popup, Some(Popup::Login { .. })) {
                 return Ok(());
@@ -1003,6 +1124,7 @@ impl Controller {
             return Ok(());
         }
 
+        let key = normalize_list_navigation(key);
         match self.state.popup.clone() {
             Some(Popup::Models { selected }) => match key.code {
                 KeyCode::Char('k') => {
@@ -1079,17 +1201,20 @@ impl Controller {
             Some(Popup::Resume {
                 selected,
                 loading: false,
+                scope,
             }) => match key.code {
-                KeyCode::Char('k') => {
+                KeyCode::Char('k') | KeyCode::Up => {
                     self.state.popup = Some(Popup::Resume {
                         selected: selected.saturating_sub(1),
                         loading: false,
+                        scope,
                     });
                 }
-                KeyCode::Char('j') => {
+                KeyCode::Char('j') | KeyCode::Down => {
                     self.state.popup = Some(Popup::Resume {
                         selected: (selected + 1).min(self.state.threads.len().saturating_sub(1)),
                         loading: false,
+                        scope,
                     });
                 }
                 KeyCode::Enter => return self.resume(selected),
@@ -1124,6 +1249,7 @@ impl Controller {
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) -> Result<()> {
+        let key = normalize_list_navigation(key);
         let Some(Popup::Approval(current)) = self.state.popup.as_mut() else {
             return Ok(());
         };
@@ -1201,7 +1327,7 @@ impl Controller {
                     return Ok(());
                 }
                 KeyCode::Esc => return self.finish_user_input(true),
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Enter if is_newline_key(key) => {
                     request.input.newline();
                     return Ok(());
                 }
@@ -1219,17 +1345,12 @@ impl Controller {
                 KeyCode::Delete => request.input.delete(),
                 KeyCode::Left => request.input.left(),
                 KeyCode::Right => request.input.right(),
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    request.input.cursor = 0
-                }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    request.input.cursor = request.input.text.len()
-                }
                 _ => {}
             }
             return Ok(());
         }
 
+        let key = normalize_list_navigation(key);
         let option_count = question.options.len() + usize::from(question.allow_other);
         match key.code {
             KeyCode::Char('k') | KeyCode::Up => {
@@ -1554,6 +1675,69 @@ impl Controller {
     }
 }
 
+fn toggle_latest_command(state: &mut AppState) {
+    let expanded = state
+        .blocks
+        .iter_mut()
+        .rev()
+        .find(|block| {
+            matches!(
+                block.kind,
+                BlockKind::Command | BlockKind::File | BlockKind::Web
+            )
+        })
+        .and_then(|block| {
+            if block.kind != BlockKind::Command {
+                return None;
+            }
+            block.expanded = !block.expanded;
+            Some(block.expanded)
+        });
+    if let Some(expanded) = expanded {
+        state.mark_transcript_dirty();
+        if expanded {
+            state.jump_to_bottom();
+        }
+    }
+}
+
+pub(crate) fn normalize_control_shortcut(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        key.code = match key.code {
+            KeyCode::Char(ch) => KeyCode::Char(latin_shortcut_char(ch)),
+            code => code,
+        };
+    }
+    key
+}
+
+fn normalize_list_navigation(mut key: KeyEvent) -> KeyEvent {
+    key.code = match key.code {
+        KeyCode::Char('о' | 'О') => KeyCode::Char('j'),
+        KeyCode::Char('л' | 'Л') => KeyCode::Char('k'),
+        code => code,
+    };
+    key
+}
+
+fn is_newline_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn latin_shortcut_char(ch: char) -> char {
+    match ch {
+        'с' | 'С' => 'c',
+        'м' | 'М' => 'v',
+        'з' | 'З' => 'p',
+        'т' | 'Т' => 'n',
+        'л' | 'Л' => 'k',
+        'о' | 'О' => 'j',
+        'п' | 'П' => 'g',
+        'щ' | 'Щ' => 'o',
+        _ => ch,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ApprovalChoice {
     Allow,
@@ -1632,6 +1816,18 @@ fn collaboration_mode_payload(state: &AppState) -> Option<Value> {
             "developer_instructions": null
         }
     }))
+}
+
+fn alternate_collaboration_mode_index(state: &AppState) -> Option<usize> {
+    let target = if state.collaboration_mode == "plan" {
+        "default"
+    } else {
+        "plan"
+    };
+    state
+        .collaboration_modes
+        .iter()
+        .position(|mode| mode.id == target)
 }
 
 fn parse_user_input_request(id: Value, params: &Value) -> Option<UserInputRequest> {
@@ -2042,12 +2238,132 @@ fn image_labels(count: usize) -> String {
         .join(" ")
 }
 
-fn thread_list_params(cwd: &str) -> Value {
+fn trust_target_from_config(result: &Value, cwd: &str) -> Option<String> {
+    let config = result.get("config").unwrap_or(result);
+    let projects = config.get("projects").and_then(Value::as_object);
+    let project_layers = result
+        .get("layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|layer| layer.pointer("/name/type").and_then(Value::as_str) == Some("project"))
+        .collect::<Vec<_>>();
+
+    if let Some(layer) = project_layers.iter().rev().find(|layer| {
+        layer
+            .get("disabledReason")
+            .and_then(Value::as_str)
+            .is_some()
+    }) {
+        let reason = layer
+            .get("disabledReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let trust_target = trust_target_from_disabled_layer(layer, reason)
+            .unwrap_or_else(|| project_root_from_config(config, cwd));
+        if project_has_trust_decision(projects, &trust_target)
+            || reason.contains("marked as untrusted")
+        {
+            return None;
+        }
+        if reason.contains("trusted project") {
+            return Some(trust_target);
+        }
+    }
+
+    if project_layers
+        .iter()
+        .any(|layer| layer.get("disabledReason").is_none())
+    {
+        return None;
+    }
+
+    let trust_target = project_root_from_config(config, cwd);
+    if project_has_trust_decision(projects, &trust_target)
+        || projects.into_iter().flatten().any(|(path, project)| {
+            project.get("trust_level").and_then(Value::as_str) == Some("untrusted")
+                && Path::new(cwd).starts_with(path)
+        })
+    {
+        None
+    } else {
+        Some(trust_target)
+    }
+}
+
+fn trust_target_from_disabled_layer(layer: &Value, reason: &str) -> Option<String> {
+    reason
+        .split_once(", add ")
+        .and_then(|(_, suffix)| suffix.rsplit_once(" as a trusted project in "))
+        .map(|(path, _)| path.to_string())
+        .or_else(|| {
+            layer
+                .pointer("/name/dotCodexFolder")
+                .and_then(Value::as_str)
+                .and_then(|path| {
+                    path.strip_suffix("/.codex")
+                        .or_else(|| path.strip_suffix("\\.codex"))
+                })
+                .map(str::to_owned)
+        })
+}
+
+fn project_has_trust_decision(
+    projects: Option<&serde_json::Map<String, Value>>,
+    trust_target: &str,
+) -> bool {
+    projects
+        .and_then(|projects| projects.get(trust_target))
+        .and_then(|project| project.get("trust_level"))
+        .and_then(Value::as_str)
+        .is_some_and(|level| matches!(level, "trusted" | "untrusted"))
+}
+
+fn project_root_from_config(config: &Value, cwd: &str) -> String {
+    let markers = config
+        .get("project_root_markers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for ancestor in Path::new(cwd).ancestors() {
+        if markers.iter().any(|marker| ancestor.join(marker).exists()) {
+            return ancestor.to_string_lossy().into_owned();
+        }
+    }
+    cwd.to_string()
+}
+
+fn trust_write_params(trust_target: &str) -> Value {
+    let escaped = trust_target.replace('\\', "\\\\").replace('"', "\\\"");
     json!({
-        "cwd": cwd,
+        "edits": [{
+            "keyPath": format!("projects.\"{escaped}\".trust_level"),
+            "value": "trusted",
+            "mergeStrategy": "replace"
+        }],
+        "reloadUserConfig": true
+    })
+}
+
+fn thread_list_params(cwd: &str, scope: ResumeScope) -> Value {
+    let mut params = json!({
         "limit": 50,
         "sortKey": "updated_at",
         "sortDirection": "desc"
+    });
+    if scope == ResumeScope::CurrentDirectory {
+        params["cwd"] = Value::String(cwd.to_string());
+    }
+    params
+}
+
+fn thread_resume_params(thread_id: &str, cwd: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "cwd": cwd,
+        "excludeTurns": true
     })
 }
 
@@ -2288,6 +2604,49 @@ mod tests {
     }
 
     #[test]
+    fn undecided_project_trust_is_detected_from_disabled_config_layer() {
+        let mut response = json!({
+            "config": {
+                "projects": {},
+                "project_root_markers": [".git"]
+            },
+            "layers": [{
+                "name": {
+                    "type": "project",
+                    "dotCodexFolder": "/work/project/.codex"
+                },
+                "disabledReason": "To load project-local config, hooks, and exec policies, add /work/project as a trusted project in /home/user/.codex/config.toml."
+            }]
+        });
+
+        assert_eq!(
+            trust_target_from_config(&response, "/work/project/src"),
+            Some("/work/project".into())
+        );
+
+        response["config"]["projects"]["/work/project"] = json!({"trust_level": "trusted"});
+        assert_eq!(
+            trust_target_from_config(&response, "/work/project/src"),
+            None
+        );
+    }
+
+    #[test]
+    fn project_trust_write_uses_the_official_config_batch_shape() {
+        assert_eq!(
+            trust_write_params("/work/project\"quoted\""),
+            json!({
+                "edits": [{
+                    "keyPath": r#"projects."/work/project\"quoted\"".trust_level"#,
+                    "value": "trusted",
+                    "mergeStrategy": "replace"
+                }],
+                "reloadUserConfig": true
+            })
+        );
+    }
+
+    #[test]
     fn clipboard_images_use_the_app_server_input_shape() {
         let images = vec![
             ImageAttachment {
@@ -2361,12 +2720,36 @@ mod tests {
     #[test]
     fn thread_list_is_scoped_to_the_current_directory() {
         assert_eq!(
-            thread_list_params("/work/magdex"),
+            thread_list_params("/work/magdex", ResumeScope::CurrentDirectory),
             json!({
                 "cwd": "/work/magdex",
                 "limit": 50,
                 "sortKey": "updated_at",
                 "sortDirection": "desc"
+            })
+        );
+    }
+
+    #[test]
+    fn thread_list_can_include_all_directories() {
+        assert_eq!(
+            thread_list_params("/work/magdex", ResumeScope::AllDirectories),
+            json!({
+                "limit": 50,
+                "sortKey": "updated_at",
+                "sortDirection": "desc"
+            })
+        );
+    }
+
+    #[test]
+    fn resumed_threads_use_the_current_working_directory() {
+        assert_eq!(
+            thread_resume_params("thread-1", "/work/current"),
+            json!({
+                "threadId": "thread-1",
+                "cwd": "/work/current",
+                "excludeTurns": true
             })
         );
     }
@@ -2505,6 +2888,31 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn tab_mode_toggle_alternates_between_default_and_plan() {
+        let mut state = AppState::new("/project".into(), true);
+
+        assert_eq!(alternate_collaboration_mode_index(&state), Some(0));
+        state.collaboration_mode = "plan".into();
+        assert_eq!(alternate_collaboration_mode_index(&state), Some(1));
+    }
+
+    #[test]
+    fn only_shift_enter_inserts_a_newline() {
+        assert!(is_newline_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_newline_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::ALT
+        )));
+        assert!(!is_newline_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
@@ -2664,5 +3072,56 @@ mod tests {
             turn_duration_ms(&json!({"durationMs": 48_982})),
             Some(48_982)
         );
+    }
+
+    #[test]
+    fn control_shortcuts_follow_the_same_physical_keys_on_russian_layout() {
+        for (russian, latin) in [
+            ('с', 'c'),
+            ('м', 'v'),
+            ('з', 'p'),
+            ('т', 'n'),
+            ('л', 'k'),
+            ('о', 'j'),
+            ('п', 'g'),
+            ('щ', 'o'),
+        ] {
+            let key = KeyEvent::new(KeyCode::Char(russian), KeyModifiers::CONTROL);
+            assert_eq!(normalize_control_shortcut(key).code, KeyCode::Char(latin));
+        }
+
+        let text = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::NONE);
+        assert_eq!(normalize_control_shortcut(text).code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn list_navigation_supports_russian_layout_without_changing_other_text() {
+        let down = KeyEvent::new(KeyCode::Char('о'), KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Char('л'), KeyModifiers::NONE);
+        let text = KeyEvent::new(KeyCode::Char('я'), KeyModifiers::NONE);
+
+        assert_eq!(normalize_list_navigation(down).code, KeyCode::Char('j'));
+        assert_eq!(normalize_list_navigation(up).code, KeyCode::Char('k'));
+        assert_eq!(normalize_list_navigation(text).code, KeyCode::Char('я'));
+    }
+
+    #[test]
+    fn expanding_latest_command_follows_its_output_to_the_bottom() {
+        let mut state = AppState::new("/project".into(), true);
+        state.scroll = 12;
+        state.at_bottom = false;
+        state.new_output = true;
+        state.push(TranscriptBlock::new(
+            BlockKind::Command,
+            "python3 -c long-command",
+            "long output",
+        ));
+
+        toggle_latest_command(&mut state);
+
+        assert!(state.blocks.last().unwrap().expanded);
+        assert_eq!(state.scroll, usize::MAX);
+        assert!(state.at_bottom);
+        assert!(!state.new_output);
     }
 }

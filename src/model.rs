@@ -109,10 +109,35 @@ pub struct ThreadSummary {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeScope {
+    CurrentDirectory,
+    AllDirectories,
+}
+
+impl ResumeScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::CurrentDirectory => Self::AllDirectories,
+            Self::AllDirectories => Self::CurrentDirectory,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResumePicker {
     pub selected: usize,
     pub loading: bool,
+    pub error: Option<String>,
+    pub scope: ResumeScope,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrustDirectoryPrompt {
+    pub cwd: String,
+    pub trust_target: String,
+    pub selected: usize,
+    pub saving: bool,
     pub error: Option<String>,
 }
 
@@ -130,6 +155,7 @@ pub enum Popup {
     Resume {
         selected: usize,
         loading: bool,
+        scope: ResumeScope,
     },
     History {
         selected: usize,
@@ -138,6 +164,7 @@ pub enum Popup {
         url: Option<String>,
         error: Option<String>,
     },
+    TrustDirectory(TrustDirectoryPrompt),
     Approval(Approval),
     UserInput(UserInputRequest),
     Disconnected {
@@ -322,22 +349,6 @@ impl Composer {
             self.cursor = *cursor;
             self.preferred_column = Some(target_column);
         }
-    }
-
-    pub fn move_to_line_start(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .rfind('\n')
-            .map(|position| position + 1)
-            .unwrap_or(0);
-        self.preferred_column = None;
-    }
-
-    pub fn move_to_line_end(&mut self) {
-        self.cursor = self.text[self.cursor..]
-            .find('\n')
-            .map(|offset| self.cursor + offset)
-            .unwrap_or(self.text.len());
-        self.preferred_column = None;
     }
 
     pub fn replace(&mut self, text: String) {
@@ -730,7 +741,7 @@ impl AppState {
     }
 }
 
-fn display_path(path: &str, home: Option<&str>) -> String {
+pub fn display_path(path: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|home| !home.is_empty()) else {
         return path.to_string();
     };

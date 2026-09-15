@@ -1,6 +1,6 @@
 use ratatui::style::Stylize;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
@@ -11,9 +11,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{format_duration, relative_time, SLASH_COMMANDS},
     model::{
-        layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind, CommandAction,
-        CommandActionKind, ComposerLayout, FileChange, FileChangeKind, ImageAttachment, Popup,
-        TranscriptBlock, UserInputRequest,
+        display_path, layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind,
+        CommandAction, CommandActionKind, ComposerLayout, FileChange, FileChangeKind,
+        ImageAttachment, Popup, ResumeScope, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt,
+        UserInputRequest,
     },
 };
 
@@ -23,6 +24,7 @@ const USER_BACKGROUND: Color = Color::Rgb(48, 48, 48);
 const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 38, 38);
 const DIFF_ADD_BACKGROUND: Color = Color::Rgb(28, 65, 46);
 const DIFF_REMOVE_BACKGROUND: Color = Color::Rgb(78, 37, 34);
+const COLLAPSED_COMMAND_ROWS: usize = 3;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     if state.resume_picker.is_some() {
@@ -106,17 +108,21 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(inner);
 
+    let scope_title = match picker.scope {
+        ResumeScope::CurrentDirectory => "current",
+        ResumeScope::AllDirectories => "all",
+    };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled("Recent conversations", Style::default().bold()),
-            Line::styled(state.cwd.clone(), Style::default().fg(DIM)),
-        ]),
+        Paragraph::new(Line::styled(
+            format!("Recent conversations · {scope_title}"),
+            Style::default().bold(),
+        )),
         chunks[0],
     );
 
@@ -128,19 +134,21 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
             Style::default().fg(Color::Red),
         ))]
     } else if state.threads.is_empty() {
-        vec![ListItem::new("No conversations found in this directory")]
+        let message = match picker.scope {
+            ResumeScope::CurrentDirectory => "No conversations found in this directory",
+            ResumeScope::AllDirectories => "No conversations found",
+        };
+        vec![ListItem::new(message)]
     } else {
-        let title_width = chunks[1].width.saturating_sub(16).max(12) as usize;
+        let width = chunks[1].width.saturating_sub(2) as usize;
         state
             .threads
             .iter()
             .map(|thread| {
+                let (title, metadata) = resume_entry_parts(thread, width, picker.scope);
                 ListItem::new(Line::from(vec![
-                    Span::raw(truncate(&thread.title, title_width)),
-                    Span::styled(
-                        format!("  · {}", relative_time(thread.updated_at)),
-                        Style::default().fg(DIM),
-                    ),
+                    Span::raw(title),
+                    Span::styled(metadata, Style::default().fg(DIM)),
                 ]))
             })
             .collect()
@@ -154,7 +162,7 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new("j/k or ↑/↓ move · Enter resume · Ctrl+C quit")
+        Paragraph::new("Tab current/all · j/k or ↑/↓ move · Enter resume · Ctrl+C quit")
             .style(Style::default().fg(DIM)),
         chunks[2],
     );
@@ -459,11 +467,13 @@ fn append_command(
             Style::default().bold(),
         )];
         spans.extend(shell_command_spans(command));
-        push_wrapped_line(lines, spans, width);
+        let mut command_rows = Vec::new();
+        push_wrapped_line(&mut command_rows, spans, width);
+        append_collapsible_command(lines, command_rows, block.expanded, can_expand, width);
     }
 
     let failed = status == ActionStatus::Failed || block.exit_code.is_some_and(|code| code != 0);
-    let expanded = can_expand && block.expanded;
+    let expanded = block.expanded;
     if (!explored || expanded || failed) && !block.text.is_empty() {
         let mut output_rows = Vec::new();
         for (index, line) in block.text.lines().enumerate() {
@@ -498,6 +508,36 @@ fn append_command(
             "    declined",
             Style::default().fg(Color::Red),
         )));
+    }
+}
+
+fn append_collapsible_command(
+    lines: &mut Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    expanded: bool,
+    show_shortcut: bool,
+    width: usize,
+) {
+    let hidden = rows.len().saturating_sub(COLLAPSED_COMMAND_ROWS);
+    if expanded || hidden == 0 {
+        lines.extend(rows);
+        return;
+    }
+
+    let leading_rows = COLLAPSED_COMMAND_ROWS.saturating_sub(1);
+    lines.extend(rows.iter().take(leading_rows).cloned());
+    let mut summary = if show_shortcut {
+        format!("    … +{hidden} lines · Ctrl+O to expand")
+    } else {
+        format!("    … +{hidden} lines")
+    };
+    if summary.width() > width && show_shortcut {
+        summary = format!("    … +{hidden} · Ctrl+O");
+    }
+    let summary = truncate(&summary, width);
+    lines.push(Line::from(Span::styled(summary, Style::default().fg(DIM))));
+    if let Some(last) = rows.last() {
+        lines.push(last.clone());
     }
 }
 
@@ -1120,7 +1160,13 @@ fn draw_composer(
     suggestions: &[(&str, &str)],
     area: Rect,
 ) {
+    let shortcut_hint = composer_shortcut_hint(area.width);
     let block = Block::default()
+        .title(Line::styled(
+            format!(" {shortcut_hint} "),
+            Style::default().fg(DIM),
+        ))
+        .title_alignment(Alignment::Right)
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(DIM))
         .padding(Padding::new(2, 2, 1, 1))
@@ -1217,6 +1263,16 @@ fn draw_composer(
     }
 }
 
+fn composer_shortcut_hint(width: u16) -> &'static str {
+    match width {
+        80.. => "Tab mode · Ctrl+P/N history · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end",
+        60.. => "Tab mode · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end",
+        42.. => "Tab mode · Ctrl+O expand · Ctrl+G end",
+        26.. => "Tab mode · Ctrl+G end",
+        _ => "Tab mode",
+    }
+}
+
 fn attachment_row_count(count: usize) -> u16 {
     count.min(3) as u16
 }
@@ -1272,6 +1328,10 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
                 let text = account_text(url.as_deref(), error.as_deref());
                 text_panel_height(&text, width)
             }
+        }
+        Popup::TrustDirectory(prompt) => {
+            let detail = trust_directory_detail(prompt);
+            (visual_line_count(&detail, width) as u16 + 5).clamp(10, 20)
         }
         Popup::Approval(approval) => {
             let option_count = approval_options(&approval.kind).len();
@@ -1352,7 +1412,11 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 .unwrap_or_default();
             draw_list_panel(frame, "Reasoning", efforts, selected, 0, area)
         }
-        Popup::Resume { selected, loading } => {
+        Popup::Resume {
+            selected,
+            loading,
+            scope,
+        } => {
             let entries = if loading {
                 vec!["Loading conversations…".to_string()]
             } else if state.threads.is_empty() {
@@ -1362,20 +1426,15 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                     .threads
                     .iter()
                     .map(|thread| {
-                        let project = std::path::Path::new(&thread.cwd)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or(&thread.cwd);
-                        format!(
-                            "{}  · {}  · {}",
-                            truncate(&thread.title, 42),
-                            project,
-                            relative_time(thread.updated_at)
-                        )
+                        resume_entry_text(thread, area.width.saturating_sub(6) as usize, scope)
                     })
                     .collect()
             };
-            draw_list_panel(frame, "Resume", entries, selected, 0, area);
+            let title = match scope {
+                ResumeScope::CurrentDirectory => "Resume · current · Tab: all",
+                ResumeScope::AllDirectories => "Resume · all · Tab: current",
+            };
+            draw_list_panel(frame, title, entries, selected, 0, area);
         }
         Popup::History { selected } => {
             let messages = state
@@ -1405,6 +1464,22 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 area,
             );
         }
+        Popup::TrustDirectory(prompt) => {
+            let options = if prompt.saving {
+                &["Saving trust…"][..]
+            } else {
+                &["Yes, continue", "No, quit"][..]
+            };
+            draw_action_panel(
+                frame,
+                "Trust directory",
+                &trust_directory_detail(&prompt),
+                options,
+                prompt.selected.min(options.len().saturating_sub(1)),
+                0,
+                area,
+            );
+        }
         Popup::Approval(approval) => {
             draw_approval_panel(frame, &approval, area);
         }
@@ -1431,6 +1506,23 @@ fn account_text(url: Option<&str>, error: Option<&str>) -> String {
     } else {
         "Sign-in required\n\nStarting ChatGPT login…".to_string()
     }
+}
+
+fn trust_directory_detail(prompt: &TrustDirectoryPrompt) -> String {
+    let mut detail = format!(
+        "You are in {}\n\nDo you trust the contents of this directory? Trusting it allows project-local config, hooks, and exec policies to load.",
+        prompt.cwd
+    );
+    if prompt.cwd != prompt.trust_target {
+        detail.push_str(&format!(
+            "\n\nTrust applies to the project root: {}",
+            prompt.trust_target
+        ));
+    }
+    if let Some(error) = prompt.error.as_deref() {
+        detail.push_str(&format!("\n\nFailed to save trust: {error}"));
+    }
+    detail
 }
 
 fn approval_options(kind: &ApprovalKind) -> &'static [&'static str] {
@@ -1616,9 +1708,9 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
             .saturating_add(layout.cursor_row.saturating_sub(vertical_scroll) as u16);
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         let hint = if request.entering_other {
-            "Enter answer · Alt+Enter newline · Esc back"
+            "Enter answer · Shift+Enter newline · Esc back"
         } else {
-            "Enter answer · Alt+Enter newline · Esc cancel"
+            "Enter answer · Shift+Enter newline · Esc cancel"
         };
         frame.render_widget(
             Paragraph::new(hint).style(Style::default().fg(DIM)),
@@ -1707,6 +1799,52 @@ fn truncate(value: &str, max_width: usize) -> String {
         output.push(ch);
     }
     output
+}
+
+fn truncate_start(value: &str, max_width: usize) -> String {
+    if value.width() <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut suffix = Vec::new();
+    let mut width = 1;
+    for ch in value.chars().rev() {
+        let next = ch.width().unwrap_or(0);
+        if width + next > max_width {
+            break;
+        }
+        width += next;
+        suffix.push(ch);
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
+fn resume_entry_parts(
+    thread: &ThreadSummary,
+    max_width: usize,
+    scope: ResumeScope,
+) -> (String, String) {
+    let age = relative_time(thread.updated_at);
+    let metadata = match scope {
+        ResumeScope::CurrentDirectory => format!("  · {age}"),
+        ResumeScope::AllDirectories => {
+            let path = display_path(&thread.cwd, std::env::var("HOME").ok().as_deref());
+            let path_width = (max_width / 3)
+                .clamp(8, 30)
+                .min(max_width.saturating_sub(age.width()).saturating_sub(12));
+            format!("  · {}  · {age}", truncate_start(&path, path_width))
+        }
+    };
+    let title_width = max_width.saturating_sub(metadata.width()).max(1);
+    (truncate(&thread.title, title_width), metadata)
+}
+
+fn resume_entry_text(thread: &ThreadSummary, max_width: usize, scope: ResumeScope) -> String {
+    let (title, metadata) = resume_entry_parts(thread, max_width, scope);
+    format!("{title}{metadata}")
 }
 
 #[cfg(test)]
@@ -1845,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn long_single_line_command_output_collapses_by_visual_rows() {
+    fn expanded_command_remains_open_when_no_longer_latest() {
         let mut block = TranscriptBlock::new(
             BlockKind::Command,
             "cargo metadata --locked",
@@ -1863,7 +2001,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(rendered.contains("Ran"));
-        assert!(rendered.contains("Ctrl+O to expand"));
+        assert!(rendered.contains("Ctrl+O"));
         let flag = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -1883,8 +2021,46 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(old_rendered.contains("… +"));
+        assert!(!old_rendered.contains("… +"));
         assert!(!old_rendered.contains("Ctrl+O"));
+        assert_eq!(old_rendered.chars().filter(|ch| *ch == 'x').count(), 200);
+    }
+
+    #[test]
+    fn long_commands_keep_their_start_and_end_without_flooding_transcript() {
+        let command = format!(
+            "python3 -c {} больше",
+            (0..24)
+                .map(|index| format!("argument-{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut block = TranscriptBlock::new(BlockKind::Command, command, "");
+        block.action_status = Some(ActionStatus::Completed);
+        block.exit_code = Some(0);
+        let mut lines = Vec::new();
+
+        append_command(&mut lines, &block, 32, true);
+
+        assert_eq!(lines.len(), COLLAPSED_COMMAND_ROWS + 1);
+        assert!(lines.iter().all(|line| line.width() <= 32));
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Ran python3"));
+        assert!(rendered.contains("Ctrl+O"));
+        assert!(rendered.contains("больше"));
+
+        block.expanded = true;
+        let mut expanded = Vec::new();
+        append_command(&mut expanded, &block, 32, true);
+        assert!(expanded.len() > lines.len());
+        assert!(!expanded
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.content.contains("Ctrl+O")));
     }
 
     #[test]
@@ -2062,6 +2238,16 @@ mod tests {
         assert_eq!(buffer[(39, 2)].bg, COMPOSER_BACKGROUND);
         assert_eq!(buffer[(2, 2)].symbol(), "›");
         assert_eq!(buffer[(4, 2)].symbol(), "h");
+        let top = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert!(top.contains("Tab mode · Ctrl+G end"));
+    }
+
+    #[test]
+    fn composer_shortcuts_adapt_to_the_available_width() {
+        assert!(composer_shortcut_hint(80).contains("Ctrl+P/N history"));
+        assert!(!composer_shortcut_hint(60).contains("Ctrl+P/N"));
+        assert_eq!(composer_shortcut_hint(40), "Tab mode · Ctrl+G end");
+        assert_eq!(composer_shortcut_hint(20), "Tab mode");
     }
 
     #[test]
@@ -2118,6 +2304,7 @@ mod tests {
             selected: 0,
             loading: false,
             error: None,
+            scope: ResumeScope::CurrentDirectory,
         });
         state.threads = vec![crate::model::ThreadSummary {
             id: "thread-1".into(),
@@ -2135,12 +2322,30 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Recent conversations"));
+        assert!(rendered.contains("Recent conversations · current"));
+        assert!(!rendered.contains("Newest conversations"));
         assert!(rendered.contains("Fix transcript width"));
         assert!(rendered.contains("Ctrl+C quit"));
         assert!(!rendered.contains("Esc quit"));
         assert!(!rendered.contains("Connecting to app-server"));
         assert!(!rendered.contains("Ask Codex"));
+    }
+
+    #[test]
+    fn global_resume_entries_show_their_working_directory() {
+        let thread = ThreadSummary {
+            id: "thread-1".into(),
+            title: "Fix a different project".into(),
+            cwd: "/home/user/projects/another-project".into(),
+            updated_at: 0,
+        };
+
+        let current = resume_entry_text(&thread, 72, ResumeScope::CurrentDirectory);
+        let global = resume_entry_text(&thread, 72, ResumeScope::AllDirectories);
+
+        assert!(!current.contains("another-project"));
+        assert!(global.contains("another-project"));
+        assert!(global.width() <= 72);
     }
 
     #[test]
@@ -2271,6 +2476,35 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_ne!(buffer[(0, 11)].bg, COMPOSER_BACKGROUND);
         assert_eq!(buffer[(0, 15)].bg, COMPOSER_BACKGROUND);
+    }
+
+    #[test]
+    fn trust_prompt_shows_directory_and_requires_explicit_confirmation() {
+        let backend = ratatui::backend::TestBackend::new(70, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/work/project/src".into(), true);
+        state.popup = Some(Popup::TrustDirectory(TrustDirectoryPrompt {
+            cwd: "/work/project/src".into(),
+            trust_target: "/work/project".into(),
+            selected: 0,
+            saving: false,
+            error: None,
+        }));
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Trust directory"));
+        assert!(rendered.contains("/work/project/src"));
+        assert!(rendered.contains("project root: /work/project"));
+        assert!(rendered.contains("Yes, continue"));
+        assert!(rendered.contains("No, quit"));
     }
 
     #[test]
