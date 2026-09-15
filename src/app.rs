@@ -458,9 +458,6 @@ impl Controller {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
-        if self.state.collaboration_mode == "default" {
-            self.state.default_mode_effort = self.state.effort.clone();
-        }
     }
 
     fn load_thread_response(&mut self, result: &Value, resumed: bool) {
@@ -479,9 +476,6 @@ impl Controller {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| self.state.effort.clone());
-        if self.state.collaboration_mode == "default" {
-            self.state.default_mode_effort = self.state.effort.clone();
-        }
         self.state.clear_blocks();
         self.state.clear_message_history();
         if resumed {
@@ -916,18 +910,7 @@ impl Controller {
             self.state.popup = None;
             return Ok(());
         };
-        if self.state.collaboration_mode == "default" {
-            self.state.default_mode_effort = self.state.effort.clone();
-        }
-        self.state.collaboration_mode = mode.id;
-        self.state.explicit_collaboration_mode = true;
-        if self.state.collaboration_mode == "default" {
-            self.state.effort = self.state.default_mode_effort.clone();
-            self.state.explicit_effort = false;
-        } else if let Some(effort) = mode.effort {
-            self.state.effort = Some(effort);
-            self.state.explicit_effort = false;
-        }
+        apply_collaboration_mode(&mut self.state, &mode);
         self.state.popup = None;
 
         let (Some(thread_id), Some(mode)) = (
@@ -1162,9 +1145,6 @@ impl Controller {
                             self.state.effort = model.default_effort;
                             self.state.explicit_effort = false;
                         }
-                        if self.state.collaboration_mode == "default" {
-                            self.state.default_mode_effort = self.state.effort.clone();
-                        }
                     }
                     self.state.popup = None;
                 }
@@ -1202,9 +1182,6 @@ impl Controller {
                         if let Some(effort) = efforts.get(selected) {
                             self.state.effort = Some(effort.clone());
                             self.state.explicit_effort = true;
-                            if self.state.collaboration_mode == "default" {
-                                self.state.default_mode_effort = self.state.effort.clone();
-                            }
                         }
                         self.state.popup = None;
                     }
@@ -1615,9 +1592,6 @@ impl Controller {
                             .and_then(Value::as_str)
                     })
                     .map(str::to_owned);
-                if self.state.collaboration_mode == "default" {
-                    self.state.default_mode_effort = self.state.effort.clone();
-                }
             }
             "account/login/completed" => {
                 if params.get("success").and_then(Value::as_bool) == Some(true) {
@@ -1853,6 +1827,11 @@ fn collaboration_mode_payload(state: &AppState) -> Option<Value> {
             "developer_instructions": null
         }
     }))
+}
+
+fn apply_collaboration_mode(state: &mut AppState, mode: &CollaborationModeInfo) {
+    state.collaboration_mode = mode.id.clone();
+    state.explicit_collaboration_mode = true;
 }
 
 fn alternate_collaboration_mode_index(state: &AppState) -> Option<usize> {
@@ -2934,6 +2913,32 @@ mod tests {
         assert_eq!(alternate_collaboration_mode_index(&state), Some(0));
         state.collaboration_mode = "plan".into();
         assert_eq!(alternate_collaboration_mode_index(&state), Some(1));
+    }
+
+    #[test]
+    fn changing_mode_preserves_reasoning_effort() {
+        let mut state = AppState::new("/project".into(), true);
+        state.model = Some("gpt-test".into());
+        state.effort = Some("high".into());
+        state.explicit_effort = true;
+        let plan = state.collaboration_modes[0].clone();
+
+        apply_collaboration_mode(&mut state, &plan);
+
+        assert_eq!(state.collaboration_mode, "plan");
+        assert_eq!(state.effort.as_deref(), Some("high"));
+        assert!(state.explicit_effort);
+        assert_eq!(
+            collaboration_mode_payload(&state),
+            Some(json!({
+                "mode": "plan",
+                "settings": {
+                    "model": "gpt-test",
+                    "reasoning_effort": "high",
+                    "developer_instructions": null
+                }
+            }))
+        );
     }
 
     #[test]
