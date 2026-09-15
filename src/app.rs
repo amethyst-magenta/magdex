@@ -9,16 +9,17 @@ use serde_json::{json, Value};
 use crate::{
     model::{
         ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
-        CommandAction, CommandActionKind, FileChange, FileChangeKind, ImageAttachment, ModelInfo,
-        Popup, ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
+        CommandAction, CommandActionKind, CopyMode, FileChange, FileChangeKind, ImageAttachment,
+        ModelInfo, Popup, ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
         TrustDirectoryPrompt, UserInputOption, UserInputQuestion, UserInputRequest,
     },
     rpc::{Incoming, RpcClient},
+    ui::markdown_copy_ranges,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_OUTPUT_TRUNCATED: &str = "\n[… command output truncated by Magdex …]";
-pub const SLASH_COMMANDS: [(&str, &str); 7] = [
+pub const SLASH_COMMANDS: [(&str, &str); 8] = [
     ("/new", "New conversation"),
     ("/resume", "Resume conversation"),
     ("/mode", "Change mode"),
@@ -26,6 +27,7 @@ pub const SLASH_COMMANDS: [(&str, &str); 7] = [
     ("/reasoning", "Change reasoning effort"),
     ("/history", "Jump to a message"),
     ("/bottom", "Jump to latest output"),
+    ("/copy", "Copy an assistant response"),
 ];
 
 #[derive(Debug)]
@@ -785,6 +787,9 @@ impl Controller {
         if self.state.resume_picker.is_some() {
             return;
         }
+        if self.state.copy_mode.is_some() {
+            return;
+        }
         self.state.composer.insert_str(&pasted);
     }
 
@@ -847,6 +852,10 @@ impl Controller {
             }
             "/bottom" => {
                 self.state.jump_to_bottom();
+                Ok(())
+            }
+            "/copy" => {
+                enter_copy_mode(&mut self.state);
                 Ok(())
             }
             _ => {
@@ -981,6 +990,13 @@ impl Controller {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         let key = normalize_control_shortcut(key);
+        self.state.copy_feedback = None;
+        if self.state.copy_mode.is_some() {
+            if let Some(text) = handle_copy_mode_key(&mut self.state, key) {
+                self.copy_text(text);
+            }
+            return Ok(());
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if prepare_control_c(&mut self.state) == ControlCAction::Interrupt {
                 return self.interrupt();
@@ -1019,6 +1035,7 @@ impl Controller {
                 KeyCode::Char('n') => self.state.next_message(),
                 KeyCode::Char('g') => self.state.jump_to_bottom(),
                 KeyCode::Char('o') => toggle_latest_command(&mut self.state),
+                KeyCode::Char('y') => enter_copy_mode(&mut self.state),
                 _ => {}
             }
             return Ok(());
@@ -1038,6 +1055,14 @@ impl Controller {
             _ => {}
         }
         Ok(())
+    }
+
+    fn copy_text(&mut self, text: String) {
+        let result = Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text));
+        self.state.copy_feedback = Some(match result {
+            Ok(()) => "Copied".into(),
+            Err(error) => format!("Copy failed: {error}"),
+        });
     }
 
     fn handle_resume_picker_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1688,6 +1713,189 @@ fn toggle_latest_command(state: &mut AppState) {
     }
 }
 
+fn enter_copy_mode(state: &mut AppState) {
+    let Some(block_index) = state
+        .blocks
+        .iter()
+        .rposition(|block| block.kind == BlockKind::Assistant && !block.text.trim().is_empty())
+    else {
+        state.copy_feedback = Some("No assistant response to copy".into());
+        return;
+    };
+    state.copy_mode = Some(CopyMode::Answers { block_index });
+    state.mark_transcript_dirty();
+    scroll_to_transcript_block(state, block_index);
+}
+
+fn handle_copy_mode_key(state: &mut AppState, key: KeyEvent) -> Option<String> {
+    let key = normalize_copy_navigation(key);
+    if key.code == KeyCode::Esc
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+    {
+        match state.copy_mode.clone() {
+            Some(CopyMode::Markdown { block_index, .. }) if key.code == KeyCode::Esc => {
+                state.copy_mode = Some(CopyMode::Answers { block_index });
+            }
+            Some(_) => state.copy_mode = None,
+            None => {}
+        }
+        state.mark_transcript_dirty();
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+
+    match state.copy_mode.clone()? {
+        CopyMode::Answers { block_index } => {
+            let assistants = assistant_block_indices(state);
+            let position = assistants
+                .iter()
+                .position(|candidate| *candidate == block_index)?;
+            let next_position = match key.code {
+                KeyCode::Char('k') => position.saturating_sub(1),
+                KeyCode::Char('j') => (position + 1).min(assistants.len().saturating_sub(1)),
+                KeyCode::Char('g') => 0,
+                KeyCode::Char('G') => assistants.len().saturating_sub(1),
+                KeyCode::Enter => {
+                    let count = markdown_copy_ranges(&state.blocks[block_index].text).len();
+                    if count > 0 {
+                        state.copy_mode = Some(CopyMode::Markdown {
+                            block_index,
+                            markdown_index: 0,
+                            selected: vec![],
+                        });
+                        state.mark_transcript_dirty();
+                        reveal_markdown_block(state, block_index, 0);
+                    }
+                    return None;
+                }
+                KeyCode::Char('y' | 'Y') => {
+                    let text = state.blocks[block_index].text.clone();
+                    state.copy_mode = None;
+                    state.mark_transcript_dirty();
+                    return Some(text);
+                }
+                _ => return None,
+            };
+            let next = assistants[next_position];
+            if next != block_index {
+                state.copy_mode = Some(CopyMode::Answers { block_index: next });
+                state.mark_transcript_dirty();
+                scroll_to_transcript_block(state, next);
+            }
+        }
+        CopyMode::Markdown {
+            block_index,
+            markdown_index,
+            mut selected,
+        } => {
+            let ranges = markdown_copy_ranges(&state.blocks[block_index].text);
+            if ranges.is_empty() {
+                state.copy_mode = Some(CopyMode::Answers { block_index });
+                state.mark_transcript_dirty();
+                return None;
+            }
+            let next_index = match key.code {
+                KeyCode::Char('k') => Some(markdown_index.saturating_sub(1)),
+                KeyCode::Char('j') => Some((markdown_index + 1).min(ranges.len() - 1)),
+                KeyCode::Char('g') => Some(0),
+                KeyCode::Char('G') => Some(ranges.len() - 1),
+                KeyCode::Enter => {
+                    match selected.binary_search(&markdown_index) {
+                        Ok(position) => {
+                            selected.remove(position);
+                        }
+                        Err(position) => selected.insert(position, markdown_index),
+                    }
+                    state.copy_mode = Some(CopyMode::Markdown {
+                        block_index,
+                        markdown_index,
+                        selected,
+                    });
+                    state.mark_transcript_dirty();
+                    return None;
+                }
+                KeyCode::Char('y' | 'Y') => {
+                    let chosen = if selected.is_empty() {
+                        vec![markdown_index]
+                    } else {
+                        selected
+                    };
+                    let source = &state.blocks[block_index].text;
+                    let text = chosen
+                        .into_iter()
+                        .filter_map(|index| ranges.get(index))
+                        .map(|range| source[range.clone()].to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    state.copy_mode = None;
+                    state.mark_transcript_dirty();
+                    return Some(text);
+                }
+                _ => None,
+            };
+            if let Some(next_index) = next_index {
+                state.copy_mode = Some(CopyMode::Markdown {
+                    block_index,
+                    markdown_index: next_index,
+                    selected,
+                });
+                state.mark_transcript_dirty();
+                reveal_markdown_block(state, block_index, next_index);
+            }
+        }
+    }
+    None
+}
+
+fn assistant_block_indices(state: &AppState) -> Vec<usize> {
+    state
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            (block.kind == BlockKind::Assistant && !block.text.trim().is_empty()).then_some(index)
+        })
+        .collect()
+}
+
+fn scroll_to_transcript_block(state: &mut AppState, block_index: usize) {
+    let Some(offset) = state
+        .transcript_block_offsets
+        .get(block_index)
+        .copied()
+        .flatten()
+    else {
+        state.scroll = usize::MAX;
+        state.at_bottom = true;
+        state.new_output = false;
+        return;
+    };
+    state.scroll = offset;
+    state.at_bottom = false;
+    state.new_output = false;
+}
+
+fn reveal_markdown_block(state: &mut AppState, block_index: usize, markdown_index: usize) {
+    let Some((start, end)) = state
+        .transcript_markdown_ranges
+        .get(block_index)
+        .and_then(|ranges| ranges.get(markdown_index))
+        .copied()
+    else {
+        return;
+    };
+    let height = state.transcript_viewport_height.max(1);
+    if start < state.scroll {
+        state.scroll = start;
+    } else if end > state.scroll.saturating_add(height) {
+        state.scroll = end.saturating_sub(height);
+    }
+    state.at_bottom = false;
+    state.new_output = false;
+}
+
 fn prepare_control_c(state: &mut AppState) -> ControlCAction {
     if !state.composer.text.is_empty() || !state.image_attachments.is_empty() {
         state.composer.clear();
@@ -1731,6 +1939,22 @@ fn normalize_list_navigation(mut key: KeyEvent) -> KeyEvent {
     key
 }
 
+fn normalize_copy_navigation(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return normalize_control_shortcut(key);
+    }
+    key.code = match key.code {
+        KeyCode::Char('о' | 'О') => KeyCode::Char('j'),
+        KeyCode::Char('л' | 'Л') => KeyCode::Char('k'),
+        KeyCode::Char('п') => KeyCode::Char('g'),
+        KeyCode::Char('П') => KeyCode::Char('G'),
+        KeyCode::Char('н') => KeyCode::Char('y'),
+        KeyCode::Char('Н') => KeyCode::Char('Y'),
+        code => code,
+    };
+    key
+}
+
 fn is_newline_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT)
 }
@@ -1745,6 +1969,7 @@ fn latin_shortcut_char(ch: char) -> char {
         'о' | 'О' => 'j',
         'п' | 'П' => 'g',
         'щ' | 'Щ' => 'o',
+        'н' | 'Н' => 'y',
         _ => ch,
     }
 }
@@ -3127,6 +3352,7 @@ mod tests {
             ('о', 'j'),
             ('п', 'g'),
             ('щ', 'o'),
+            ('н', 'y'),
         ] {
             let key = KeyEvent::new(KeyCode::Char(russian), KeyModifiers::CONTROL);
             assert_eq!(normalize_control_shortcut(key).code, KeyCode::Char(latin));
@@ -3134,6 +3360,108 @@ mod tests {
 
         let text = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::NONE);
         assert_eq!(normalize_control_shortcut(text).code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn copy_mode_opens_the_latest_assistant_and_moves_between_answers() {
+        let mut state = copy_mode_state();
+
+        enter_copy_mode(&mut state);
+        assert_eq!(state.copy_mode, Some(CopyMode::Answers { block_index: 3 }));
+        assert_eq!(state.scroll, 30);
+
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('л'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.copy_mode, Some(CopyMode::Answers { block_index: 1 }));
+        assert_eq!(state.scroll, 10);
+
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('П'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(state.copy_mode, Some(CopyMode::Answers { block_index: 3 }));
+    }
+
+    #[test]
+    fn copy_mode_marks_multiple_markdown_blocks_and_copies_in_source_order() {
+        let mut state = copy_mode_state();
+        enter_copy_mode(&mut state);
+
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('о'), KeyModifiers::NONE),
+        );
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('о'), KeyModifiers::NONE),
+        );
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            state.copy_mode,
+            Some(CopyMode::Markdown {
+                block_index: 3,
+                markdown_index: 2,
+                selected: vec![0, 2],
+            })
+        );
+        let copied = handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('н'), KeyModifiers::NONE),
+        );
+        assert_eq!(copied.as_deref(), Some("## Newest\n\nlet value = 1;"));
+        assert!(state.copy_mode.is_none());
+    }
+
+    #[test]
+    fn copy_mode_escape_returns_to_answers_before_closing() {
+        let mut state = copy_mode_state();
+        enter_copy_mode(&mut state);
+        handle_copy_mode_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        handle_copy_mode_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.copy_mode, Some(CopyMode::Answers { block_index: 3 }));
+        handle_copy_mode_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.copy_mode.is_none());
+    }
+
+    fn copy_mode_state() -> AppState {
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![
+            TranscriptBlock::new(BlockKind::User, "You", "first"),
+            TranscriptBlock::new(BlockKind::Assistant, "Codex", "# Older\n\nText"),
+            TranscriptBlock::new(BlockKind::User, "You", "second"),
+            TranscriptBlock::new(
+                BlockKind::Assistant,
+                "Codex",
+                "## Newest\n\nParagraph\n\n```rust\nlet value = 1;\n```",
+            ),
+        ];
+        state.transcript_block_offsets = vec![Some(0), Some(10), Some(20), Some(30)];
+        state.transcript_markdown_ranges = vec![
+            vec![],
+            vec![(10, 11), (12, 13)],
+            vec![],
+            vec![(30, 31), (32, 33), (34, 35)],
+        ];
+        state.transcript_viewport_height = 8;
+        state
     }
 
     #[test]

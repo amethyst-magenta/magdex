@@ -4,22 +4,24 @@ mod model;
 mod rpc;
 mod ui;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
+    cursor::{MoveTo, RestorePosition, SavePosition},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, EventStream,
         KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    execute,
-    style::Print,
+    execute, queue,
+    style::{Attribute, Colors, Print, ResetColor, SetAttribute, SetColors},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
+    style::Modifier,
     Terminal,
 };
 
@@ -72,19 +74,42 @@ async fn main() -> Result<()> {
     let mut rpc_open = true;
     let mut dirty = true;
     let mut full_redraw = false;
+    let mut hyperlink_overlay = Vec::new();
     let zellij_redraw_workaround = running_in_zellij();
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(33));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = redraw.tick(), if dirty => {
+                let was_full_redraw = full_redraw;
                 if full_redraw {
                     invalidate_previous_frame(&mut guard.terminal);
                     full_redraw = false;
                 }
-                guard
-                    .terminal
-                    .draw(|frame| ui::draw(frame, &mut controller.state))?;
+                let (next_hyperlink_overlay, cleanup) = {
+                    let completed = guard
+                        .terminal
+                        .draw(|frame| ui::draw(frame, &mut controller.state))?;
+                    let next_hyperlink_overlay = ui::terminal_hyperlink_overlay(
+                        completed.buffer,
+                        &controller.state.visible_hyperlinks,
+                    );
+                    let cleanup = if next_hyperlink_overlay != hyperlink_overlay {
+                        ui::terminal_hyperlink_cleanup(completed.buffer, &hyperlink_overlay)
+                    } else {
+                        Vec::new()
+                    };
+                    (next_hyperlink_overlay, cleanup)
+                };
+                let overlay_changed = next_hyperlink_overlay != hyperlink_overlay;
+                if overlay_changed || was_full_redraw {
+                    write_terminal_hyperlinks(
+                        guard.terminal.backend_mut(),
+                        &cleanup,
+                        &next_hyperlink_overlay,
+                    )?;
+                }
+                hyperlink_overlay = next_hyperlink_overlay;
                 dirty = false;
             }
             _ = wait_for_next_working_frame(controller.state.turn_started_at) => dirty = true,
@@ -204,11 +229,15 @@ fn event_requests_full_redraw(event: &Event, zellij_workaround: bool) -> bool {
                 && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             let key = normalize_control_shortcut(*key);
-            zellij_workaround && matches!(key.code, KeyCode::Char('k' | 'j' | 'g' | 'o'))
+            zellij_workaround && matches!(key.code, KeyCode::Char('k' | 'j' | 'g' | 'o' | 'y'))
         }
-        // Wheel input arrives in bursts. Repainting the entire screen for each
-        // event overloads multiplexers and is unnecessary for plain scrolling.
-        Event::Mouse(_) => false,
+        Event::Mouse(mouse) => {
+            zellij_workaround
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+        }
         Event::Resize(_, _) => true,
         _ => false,
     }
@@ -223,6 +252,74 @@ fn invalidate_previous_frame<B: Backend>(terminal: &mut Terminal<B>) {
         cell.set_skip(true);
     }
     terminal.swap_buffers();
+}
+
+fn write_terminal_hyperlinks<W: Write>(
+    writer: &mut W,
+    cleanup: &[ui::TerminalOverlayCell],
+    hyperlinks: &[ui::TerminalHyperlinkOverlay],
+) -> io::Result<()> {
+    if cleanup.is_empty() && hyperlinks.is_empty() {
+        return Ok(());
+    }
+
+    queue!(writer, SavePosition)?;
+    for cell in cleanup {
+        queue_terminal_cell(writer, cell, None)?;
+    }
+    for hyperlink in hyperlinks {
+        for cell in &hyperlink.cells {
+            queue_terminal_cell(writer, cell, Some(&hyperlink.url))?;
+        }
+    }
+    queue!(
+        writer,
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        RestorePosition
+    )?;
+    writer.flush()
+}
+
+fn queue_terminal_cell<W: Write>(
+    writer: &mut W,
+    overlay: &ui::TerminalOverlayCell,
+    hyperlink: Option<&str>,
+) -> io::Result<()> {
+    let cell = &overlay.cell;
+    queue!(
+        writer,
+        MoveTo(overlay.position.x, overlay.position.y),
+        SetAttribute(Attribute::Reset),
+        SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+    )?;
+    for (modifier, attribute) in [
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::HIDDEN, Attribute::Hidden),
+    ] {
+        if cell.modifier.contains(modifier) {
+            queue!(writer, SetAttribute(attribute))?;
+        }
+    }
+
+    if let Some(url) = hyperlink {
+        queue!(
+            writer,
+            Print(format!(
+                "\x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
+                cell.symbol()
+            ))
+        )
+    } else {
+        queue!(writer, Print(cell.symbol()))
+    }
 }
 
 fn running_in_zellij() -> bool {
@@ -295,12 +392,19 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::Cell,
+        layout::Position,
+        style::{Color, Modifier},
+        Terminal,
+    };
 
     use super::{
         event_requests_full_redraw, invalidate_previous_frame, next_working_redraw,
-        WORKING_FRAME_MILLIS,
+        write_terminal_hyperlinks, WORKING_FRAME_MILLIS,
     };
+    use crate::ui::{TerminalHyperlinkOverlay, TerminalOverlayCell};
 
     #[test]
     fn working_redraw_aligns_with_turn_frames() {
@@ -316,12 +420,12 @@ mod tests {
 
     #[test]
     fn zellij_transcript_workaround_requests_a_full_redraw() {
-        for code in ['k', 'j', 'g', 'o'] {
+        for code in ['k', 'j', 'g', 'o', 'y'] {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
             assert!(event_requests_full_redraw(&event, true));
             assert!(!event_requests_full_redraw(&event, false));
         }
-        for code in ['л', 'о', 'п', 'щ'] {
+        for code in ['л', 'о', 'п', 'щ', 'н'] {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
             assert!(event_requests_full_redraw(&event, true));
             assert!(!event_requests_full_redraw(&event, false));
@@ -329,13 +433,23 @@ mod tests {
 
         let plain_key = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert!(!event_requests_full_redraw(&plain_key, true));
-        let wheel = Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            let wheel = Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(event_requests_full_redraw(&wheel, true));
+            assert!(!event_requests_full_redraw(&wheel, false));
+        }
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(!event_requests_full_redraw(&wheel, true));
+        assert!(!event_requests_full_redraw(&moved, true));
         assert!(event_requests_full_redraw(&Event::Resize(120, 40), false));
     }
 
@@ -348,5 +462,26 @@ mod tests {
         terminal.draw(|_| {}).unwrap();
 
         assert_eq!(terminal.backend().buffer(), TestBackend::new(5, 1).buffer());
+    }
+
+    #[test]
+    fn hyperlink_overlay_writes_osc8_without_changing_visible_text() {
+        let mut cell = Cell::default();
+        cell.set_symbol("L")
+            .set_fg(Color::Blue)
+            .set_style(Modifier::UNDERLINED);
+        let overlay = TerminalHyperlinkOverlay {
+            url: "https://example.com".into(),
+            cells: vec![TerminalOverlayCell {
+                position: Position::new(2, 3),
+                cell,
+            }],
+        };
+        let mut output = Vec::new();
+
+        write_terminal_hyperlinks(&mut output, &[], &[overlay]).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b]8;;https://example.com\x1b\\L\x1b]8;;\x1b\\"));
     }
 }

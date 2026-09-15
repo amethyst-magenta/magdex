@@ -36,6 +36,7 @@ magdex resume
 | `Enter` | Send |
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+V` | Paste text or attach an image from the system clipboard |
+| `Ctrl+Y` | Open Copy mode at the latest assistant response |
 | `Ctrl+C` | Clear input; interrupt when empty; quit when idle and empty |
 | `Ctrl+P` / `Ctrl+N` | Recall older/newer messages in the composer |
 | `↑` / `↓` | Move between composer lines |
@@ -51,9 +52,17 @@ Press `Ctrl+V` to attach an image from the system clipboard. Repeat to attach
 multiple images; an image-only turn is also supported. If the clipboard holds
 text, `Ctrl+V` inserts that text normally.
 
+Rendered Markdown links with `http://` or `https://` targets use native terminal
+hyperlinks. In Alacritty, hold `Shift` while hovering or clicking when Magdex or a
+terminal multiplexer has captured the mouse; `Ctrl+Shift+O` opens keyboard hints.
+
+Copy mode starts on the latest assistant response. Use `j`/`k` to move between
+responses, `Enter` to inspect its Markdown blocks, `Enter` again to toggle any
+number of blocks, and `y` to copy the selected blocks. `Esc` moves back one level.
+
 The textual commands are `/new`, `/resume`, `/mode`, `/model`, `/reasoning`,
-`/history`, and `/bottom`. `/history` lists your messages in the current thread;
-selecting one jumps to it in the transcript.
+`/history`, `/bottom`, and `/copy`. `/history` lists your messages in the current
+thread; selecting one jumps to it in the transcript.
 Typing `/` in the composer shows and filters the available commands.
 `/new` switches to a new thread without deleting the current one; `/resume`
 switches to a stored thread. Its picker starts with the current directory and can

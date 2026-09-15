@@ -1,5 +1,8 @@
+use std::ops::Range;
+
 use ratatui::style::Stylize;
 use ratatui::{
+    buffer::{Buffer, Cell},
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -12,9 +15,9 @@ use crate::{
     app::{format_duration, relative_time, SLASH_COMMANDS},
     model::{
         display_path, layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind,
-        CommandAction, CommandActionKind, ComposerLayout, FileChange, FileChangeKind,
-        ImageAttachment, Popup, ResumeScope, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt,
-        UserInputRequest,
+        CommandAction, CommandActionKind, ComposerLayout, CopyMode, FileChange, FileChangeKind,
+        ImageAttachment, Popup, ResumeScope, ThreadSummary, TranscriptBlock, TranscriptHyperlink,
+        TrustDirectoryPrompt, UserInputRequest, VisibleHyperlink,
     },
 };
 
@@ -24,9 +27,17 @@ const USER_BACKGROUND: Color = Color::Rgb(48, 48, 48);
 const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 38, 38);
 const DIFF_ADD_BACKGROUND: Color = Color::Rgb(28, 65, 46);
 const DIFF_REMOVE_BACKGROUND: Color = Color::Rgb(78, 37, 34);
+const COPY_ANSWER_BACKGROUND: Color = Color::Rgb(25, 43, 45);
+const COPY_CURSOR_BACKGROUND: Color = Color::Rgb(38, 67, 70);
+const COPY_SELECTED_BACKGROUND: Color = Color::Rgb(35, 51, 72);
+const COPY_SELECTED_CURSOR_BACKGROUND: Color = Color::Rgb(47, 72, 91);
 const COLLAPSED_COMMAND_ROWS: usize = 3;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
+    state.visible_hyperlinks.clear();
+    if state.popup.is_some() && state.copy_mode.take().is_some() {
+        state.mark_transcript_dirty();
+    }
     if state.resume_picker.is_some() {
         draw_resume_workspace(frame, state);
         return;
@@ -195,6 +206,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    state.transcript_viewport_height = area.height as usize;
     rebuild_transcript_cache(state, area.width);
 
     let mut tail = Vec::with_capacity(3);
@@ -243,6 +255,89 @@ fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
         );
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    state.visible_hyperlinks = state
+        .transcript_hyperlinks
+        .iter()
+        .filter_map(|link| {
+            if !(scroll..visible_end).contains(&link.line) {
+                return None;
+            }
+            let row = area.y.saturating_add((link.line - scroll) as u16);
+            let start = area.x.saturating_add(link.start as u16);
+            let end = area.x.saturating_add(link.end as u16).min(area.right());
+            (start < end).then(|| VisibleHyperlink {
+                row,
+                start,
+                end,
+                url: link.url.clone(),
+            })
+        })
+        .collect();
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalOverlayCell {
+    pub position: Position,
+    pub cell: Cell,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalHyperlinkOverlay {
+    pub url: String,
+    pub cells: Vec<TerminalOverlayCell>,
+}
+
+pub(crate) fn terminal_hyperlink_overlay(
+    buffer: &Buffer,
+    links: &[VisibleHyperlink],
+) -> Vec<TerminalHyperlinkOverlay> {
+    links
+        .iter()
+        .filter_map(|link| {
+            let cells = (link.start..link.end)
+                .filter_map(|column| {
+                    let position = Position::new(column, link.row);
+                    let cell = buffer.cell(position)?;
+                    (!cell.skip).then(|| TerminalOverlayCell {
+                        position,
+                        cell: cell.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!cells.is_empty()).then(|| TerminalHyperlinkOverlay {
+                url: link.url.clone(),
+                cells,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn terminal_hyperlink_cleanup(
+    buffer: &Buffer,
+    previous: &[TerminalHyperlinkOverlay],
+) -> Vec<TerminalOverlayCell> {
+    let mut cells = Vec::new();
+    for position in previous
+        .iter()
+        .flat_map(|link| link.cells.iter().map(|cell| cell.position))
+    {
+        if cells
+            .iter()
+            .any(|cell: &TerminalOverlayCell| cell.position == position)
+        {
+            continue;
+        }
+        let Some(cell) = buffer.cell(position) else {
+            continue;
+        };
+        if !cell.skip {
+            cells.push(TerminalOverlayCell {
+                position,
+                cell: cell.clone(),
+            });
+        }
+    }
+    cells
 }
 
 fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
@@ -256,6 +351,9 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
     let render_width = width.max(1);
     let mut lines = Vec::new();
     let mut block_offsets = vec![None; state.blocks.len()];
+    let mut markdown_ranges = vec![vec![]; state.blocks.len()];
+    let mut hyperlinks = Vec::new();
+    let copy_mode = state.copy_mode.clone();
     let mut in_activity = false;
     let current_action = state.blocks.iter().rposition(|block| {
         matches!(
@@ -290,13 +388,18 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
             in_activity = false;
         }
         block_offsets[index] = Some(lines.len());
-        append_block(
+        markdown_ranges[index] = append_block_with_copy_mode(
             &mut lines,
+            &mut hyperlinks,
             block,
-            content_width as usize,
-            render_width as usize,
-            &state.cwd,
-            current_action == Some(index) && block.kind == BlockKind::Command,
+            BlockRenderContext {
+                width: content_width as usize,
+                render_width: render_width as usize,
+                cwd: &state.cwd,
+                can_expand: current_action == Some(index) && block.kind == BlockKind::Command,
+                copy_mode: copy_mode.as_ref(),
+                block_index: index,
+            },
         );
     }
     if in_activity {
@@ -307,8 +410,11 @@ fn rebuild_transcript_cache(state: &mut AppState, width: u16) {
     state.transcript_cache_revision = state.transcript_revision;
     state.transcript_cache_lines = lines;
     state.transcript_block_offsets = block_offsets;
+    state.transcript_markdown_ranges = markdown_ranges;
+    state.transcript_hyperlinks = hyperlinks;
 }
 
+#[cfg(test)]
 fn append_block(
     lines: &mut Vec<Line<'static>>,
     block: &TranscriptBlock,
@@ -317,19 +423,101 @@ fn append_block(
     cwd: &str,
     can_expand: bool,
 ) {
+    append_block_with_copy_mode(
+        lines,
+        &mut Vec::new(),
+        block,
+        BlockRenderContext {
+            width,
+            render_width,
+            cwd,
+            can_expand,
+            copy_mode: None,
+            block_index: usize::MAX,
+        },
+    );
+}
+
+struct BlockRenderContext<'a> {
+    width: usize,
+    render_width: usize,
+    cwd: &'a str,
+    can_expand: bool,
+    copy_mode: Option<&'a CopyMode>,
+    block_index: usize,
+}
+
+fn append_block_with_copy_mode(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    block: &TranscriptBlock,
+    context: BlockRenderContext<'_>,
+) -> Vec<(usize, usize)> {
+    let BlockRenderContext {
+        width,
+        render_width,
+        cwd,
+        can_expand,
+        copy_mode,
+        block_index,
+    } = context;
+    let selected_answer = copy_mode.is_some_and(|mode| match mode {
+        CopyMode::Answers {
+            block_index: selected,
+        }
+        | CopyMode::Markdown {
+            block_index: selected,
+            ..
+        } => *selected == block_index,
+    });
+    let markdown_selection = copy_mode.and_then(|mode| match mode {
+        CopyMode::Markdown {
+            block_index: selected,
+            markdown_index,
+            selected: marked,
+        } if *selected == block_index => Some((*markdown_index, marked.as_slice())),
+        _ => None,
+    });
+    let mut markdown_ranges = Vec::new();
     match block.kind {
         BlockKind::User => {
             let start = lines.len();
             lines.push(Line::default());
-            append_markdown(lines, &block.text, "  ", Style::default(), width);
+            append_markdown_with_hyperlinks(
+                lines,
+                hyperlinks,
+                &block.text,
+                "  ",
+                Style::default(),
+                width,
+            );
             lines.push(Line::default());
             apply_background_band(&mut lines[start..], render_width, USER_BACKGROUND);
         }
         BlockKind::Assistant => {
-            append_markdown(lines, &block.text, "  ", Style::default(), width);
+            markdown_ranges = append_markdown_with_copy_mode(
+                lines,
+                hyperlinks,
+                &block.text,
+                MarkdownRenderContext {
+                    indent: "  ",
+                    base_style: Style::default(),
+                    width,
+                    render_width,
+                    selected_answer,
+                    selection: markdown_selection,
+                },
+            );
         }
         BlockKind::Commentary => {
-            append_markdown(lines, &block.text, "  ", Style::default().fg(DIM), width);
+            append_markdown_with_hyperlinks(
+                lines,
+                hyperlinks,
+                &block.text,
+                "  ",
+                Style::default().fg(DIM),
+                width,
+            );
         }
         BlockKind::Reasoning => {
             lines.push(Line::from(Span::styled(
@@ -386,6 +574,7 @@ fn append_block(
         }
     }
     lines.push(Line::default());
+    markdown_ranges
 }
 
 fn apply_background_band(lines: &mut [Line<'static>], width: usize, background: Color) {
@@ -921,6 +1110,7 @@ fn append_web_action(lines: &mut Vec<Line<'static>>, block: &TranscriptBlock, wi
     }
 }
 
+#[cfg(test)]
 fn append_markdown(
     lines: &mut Vec<Line<'static>>,
     source: &str,
@@ -928,39 +1118,829 @@ fn append_markdown(
     base_style: Style,
     width: usize,
 ) {
-    let mut in_code = false;
-    for raw in source.lines() {
-        if raw.trim_start().starts_with("```") {
-            in_code = !in_code;
+    append_markdown_with_hyperlinks(lines, &mut Vec::new(), source, indent, base_style, width);
+}
+
+fn append_markdown_with_hyperlinks(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    source: &str,
+    indent: &str,
+    base_style: Style,
+    width: usize,
+) {
+    append_markdown_with_copy_mode(
+        lines,
+        hyperlinks,
+        source,
+        MarkdownRenderContext {
+            indent,
+            base_style,
+            width,
+            render_width: width,
+            selected_answer: false,
+            selection: None,
+        },
+    );
+}
+
+struct MarkdownRenderContext<'a> {
+    indent: &'a str,
+    base_style: Style,
+    width: usize,
+    render_width: usize,
+    selected_answer: bool,
+    selection: Option<(usize, &'a [usize])>,
+}
+
+fn append_markdown_with_copy_mode(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    source: &str,
+    context: MarkdownRenderContext<'_>,
+) -> Vec<(usize, usize)> {
+    let MarkdownRenderContext {
+        indent,
+        base_style,
+        width,
+        render_width,
+        selected_answer,
+        selection,
+    } = context;
+    let blocks = parse_markdown_blocks(source);
+    let mut rendered_ranges = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+            if selected_answer {
+                let last = lines.len() - 1;
+                apply_background_band(&mut lines[last..], render_width, COPY_ANSWER_BACKGROUND);
+            }
+        }
+        let start = lines.len();
+        render_markdown_block(lines, hyperlinks, source, block, indent, base_style, width);
+        let end = lines.len();
+        if block.kind == MarkdownBlockKind::Rule {
+            if selected_answer {
+                apply_background_band(&mut lines[start..end], render_width, COPY_ANSWER_BACKGROUND);
+            }
             continue;
         }
-        if in_code {
-            push_wrapped_line(
+
+        let markdown_index = rendered_ranges.len();
+        rendered_ranges.push((start, end));
+        let background = selection
+            .map(|(current, selected)| {
+                let focused = current == markdown_index;
+                let marked = selected.binary_search(&markdown_index).is_ok();
+                match (focused, marked) {
+                    (true, true) => COPY_SELECTED_CURSOR_BACKGROUND,
+                    (true, false) => COPY_CURSOR_BACKGROUND,
+                    (false, true) => COPY_SELECTED_BACKGROUND,
+                    (false, false) => COPY_ANSWER_BACKGROUND,
+                }
+            })
+            .or(selected_answer.then_some(COPY_ANSWER_BACKGROUND));
+        if let Some(background) = background {
+            apply_background_band(&mut lines[start..end], render_width, background);
+        }
+    }
+    rendered_ranges
+}
+
+pub(crate) fn markdown_copy_ranges(source: &str) -> Vec<Range<usize>> {
+    parse_markdown_blocks(source)
+        .into_iter()
+        .filter_map(|block| match block.kind {
+            MarkdownBlockKind::Rule => None,
+            MarkdownBlockKind::Code { .. } => {
+                let mut range = block.content_range;
+                if source[range.clone()].ends_with("\r\n") {
+                    range.end = range.end.saturating_sub(2);
+                } else if source[range.clone()].ends_with('\n') {
+                    range.end = range.end.saturating_sub(1);
+                }
+                Some(range)
+            }
+            _ => Some(block.range),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MarkdownBlockKind {
+    Heading(u8),
+    Paragraph,
+    Code { language: String },
+    List,
+    Quote,
+    Table,
+    Rule,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkdownBlock {
+    kind: MarkdownBlockKind,
+    range: Range<usize>,
+    content_range: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MarkdownSourceLine<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+    full_end: usize,
+}
+
+fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
+    let source_lines = markdown_source_lines(source);
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < source_lines.len() {
+        if source_lines[index].text.trim().is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let first = source_lines[index];
+        if let Some((fence_length, language)) = markdown_fence(first.text) {
+            let content_start = first.full_end;
+            let mut end_index = index + 1;
+            while end_index < source_lines.len()
+                && !is_closing_markdown_fence(source_lines[end_index].text, fence_length)
+            {
+                end_index += 1;
+            }
+            let (range_end, content_end, next_index) = if end_index < source_lines.len() {
+                (
+                    source_lines[end_index].end,
+                    source_lines[end_index].start,
+                    end_index + 1,
+                )
+            } else {
+                (source.len(), source.len(), source_lines.len())
+            };
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::Code {
+                    language: language.to_string(),
+                },
+                range: first.start..range_end,
+                content_range: content_start.min(content_end)..content_end,
+            });
+            index = next_index;
+            continue;
+        }
+
+        if let Some((level, content_offset)) = markdown_heading(first.text) {
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::Heading(level),
+                range: first.start..first.end,
+                content_range: first.start + content_offset..first.end,
+            });
+            index += 1;
+            continue;
+        }
+
+        if is_markdown_rule(first.text) {
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::Rule,
+                range: first.start..first.end,
+                content_range: first.start..first.end,
+            });
+            index += 1;
+            continue;
+        }
+
+        if is_markdown_table_start(&source_lines, index) {
+            let mut end_index = index + 2;
+            while end_index < source_lines.len()
+                && !source_lines[end_index].text.trim().is_empty()
+                && source_lines[end_index].text.contains('|')
+            {
+                end_index += 1;
+            }
+            let last = source_lines[end_index - 1];
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::Table,
+                range: first.start..last.end,
+                content_range: first.start..last.end,
+            });
+            index = end_index;
+            continue;
+        }
+
+        if markdown_list_item(first.text).is_some() {
+            let mut end_index = index + 1;
+            while end_index < source_lines.len() {
+                let line = source_lines[end_index].text;
+                if line.trim().is_empty() {
+                    break;
+                }
+                if markdown_list_item(line).is_some() || markdown_leading_width(line) > 0 {
+                    end_index += 1;
+                } else {
+                    break;
+                }
+            }
+            let last = source_lines[end_index - 1];
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::List,
+                range: first.start..last.end,
+                content_range: first.start..last.end,
+            });
+            index = end_index;
+            continue;
+        }
+
+        if first.text.trim_start().starts_with('>') {
+            let mut end_index = index + 1;
+            while end_index < source_lines.len()
+                && source_lines[end_index].text.trim_start().starts_with('>')
+            {
+                end_index += 1;
+            }
+            let last = source_lines[end_index - 1];
+            blocks.push(MarkdownBlock {
+                kind: MarkdownBlockKind::Quote,
+                range: first.start..last.end,
+                content_range: first.start..last.end,
+            });
+            index = end_index;
+            continue;
+        }
+
+        let mut end_index = index + 1;
+        while end_index < source_lines.len()
+            && !source_lines[end_index].text.trim().is_empty()
+            && !starts_markdown_block(&source_lines, end_index)
+        {
+            end_index += 1;
+        }
+        let last = source_lines[end_index - 1];
+        blocks.push(MarkdownBlock {
+            kind: MarkdownBlockKind::Paragraph,
+            range: first.start..last.end,
+            content_range: first.start..last.end,
+        });
+        index = end_index;
+    }
+
+    blocks
+}
+
+fn markdown_source_lines(source: &str) -> Vec<MarkdownSourceLine<'_>> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for raw in source.split_inclusive('\n') {
+        let without_newline = raw.strip_suffix('\n').unwrap_or(raw);
+        let text = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        lines.push(MarkdownSourceLine {
+            text,
+            start: offset,
+            end: offset + text.len(),
+            full_end: offset + raw.len(),
+        });
+        offset += raw.len();
+    }
+    if source.is_empty() {
+        return lines;
+    }
+    if offset < source.len() {
+        let text = &source[offset..];
+        lines.push(MarkdownSourceLine {
+            text,
+            start: offset,
+            end: source.len(),
+            full_end: source.len(),
+        });
+    }
+    lines
+}
+
+fn starts_markdown_block(lines: &[MarkdownSourceLine<'_>], index: usize) -> bool {
+    let line = lines[index].text;
+    markdown_fence(line).is_some()
+        || markdown_heading(line).is_some()
+        || is_markdown_rule(line)
+        || is_markdown_table_start(lines, index)
+        || markdown_list_item(line).is_some()
+        || line.trim_start().starts_with('>')
+}
+
+fn markdown_fence(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let fence_length = trimmed
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    (fence_length >= 3).then(|| (fence_length, trimmed[fence_length..].trim()))
+}
+
+fn is_closing_markdown_fence(line: &str, opening_length: usize) -> bool {
+    let trimmed = line.trim();
+    let fence_length = trimmed
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    fence_length >= opening_length && trimmed[fence_length..].trim().is_empty()
+}
+
+fn markdown_heading(line: &str) -> Option<(u8, usize)> {
+    let leading = line.len() - line.trim_start_matches(' ').len();
+    if leading > 3 {
+        return None;
+    }
+    let trimmed = &line[leading..];
+    let level = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&level) || !trimmed[level..].starts_with(' ') {
+        return None;
+    }
+    Some((level as u8, leading + level + 1))
+}
+
+fn is_markdown_rule(line: &str) -> bool {
+    let compact = line
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    compact.len() >= 3
+        && compact
+            .chars()
+            .next()
+            .is_some_and(|marker| matches!(marker, '-' | '*' | '_'))
+        && compact
+            .chars()
+            .all(|character| character == compact.chars().next().unwrap())
+}
+
+fn is_markdown_table_start(lines: &[MarkdownSourceLine<'_>], index: usize) -> bool {
+    index + 1 < lines.len()
+        && lines[index].text.contains('|')
+        && is_markdown_table_delimiter(lines[index + 1].text)
+        && split_markdown_table_cells(lines[index].text).len()
+            == split_markdown_table_cells(lines[index + 1].text).len()
+}
+
+fn is_markdown_table_delimiter(line: &str) -> bool {
+    let cells = split_markdown_table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let core = cell.trim().trim_start_matches(':').trim_end_matches(':');
+            core.len() >= 3 && core.chars().all(|character| character == '-')
+        })
+}
+
+fn split_markdown_table_cells(line: &str) -> Vec<&str> {
+    let trimmed = line.trim();
+    let without_left = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let body = without_left.strip_suffix('|').unwrap_or(without_left);
+    body.split('|').map(str::trim).collect()
+}
+
+fn markdown_leading_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| character.is_whitespace())
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn markdown_list_item(line: &str) -> Option<(usize, &str, &str, bool)> {
+    let content_start = line
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+        .unwrap_or(line.len());
+    let trimmed = &line[content_start..];
+    if let Some(content) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return Some((markdown_leading_width(line), "•", content, false));
+    }
+    let digits = trimmed
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    if digits > 0 && trimmed[digits..].starts_with(". ") {
+        return Some((
+            markdown_leading_width(line),
+            &trimmed[..=digits],
+            &trimmed[digits + 2..],
+            true,
+        ));
+    }
+    None
+}
+
+fn render_markdown_block(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    source: &str,
+    block: &MarkdownBlock,
+    indent: &str,
+    base_style: Style,
+    width: usize,
+) {
+    match &block.kind {
+        MarkdownBlockKind::Heading(level) => {
+            let title_style = match level {
+                1 => base_style.fg(ACCENT).bold().underlined(),
+                2 => base_style.fg(ACCENT).bold(),
+                _ => base_style.bold(),
+            };
+            let spans = vec![MarkdownSpan::plain(Span::raw(indent.to_string()))];
+            push_wrapped_markdown_line(
                 lines,
-                vec![Span::styled(
-                    format!("{indent}  {raw}"),
-                    base_style.fg(Color::Yellow),
-                )],
+                hyperlinks,
+                spans,
+                inline_markdown_spans(&source[block.content_range.clone()], title_style),
                 width,
             );
-            continue;
         }
-        let (prefix, content, base) = if let Some(rest) = raw.strip_prefix("### ") {
-            ("", rest, base_style.bold())
-        } else if let Some(rest) = raw.strip_prefix("## ") {
-            ("", rest, base_style.bold())
-        } else if let Some(rest) = raw.strip_prefix("# ") {
-            ("", rest, base_style.bold().underlined())
-        } else if let Some(rest) = raw.strip_prefix("- ") {
-            ("  • ", rest, base_style)
-        } else if let Some(rest) = raw.strip_prefix("* ") {
-            ("  • ", rest, base_style)
+        MarkdownBlockKind::Paragraph => {
+            for raw in source[block.content_range.clone()].lines() {
+                let spans = vec![MarkdownSpan::plain(Span::raw(indent.to_string()))];
+                push_wrapped_markdown_line(
+                    lines,
+                    hyperlinks,
+                    spans,
+                    inline_markdown_spans(raw.trim(), base_style),
+                    width,
+                );
+            }
+        }
+        MarkdownBlockKind::Code { language } => {
+            if !language.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(language.clone(), Style::default().fg(DIM)),
+                ]));
+            }
+            let prefix = format!("{indent}│ ");
+            let available = width.saturating_sub(prefix.width()).max(1);
+            let content = &source[block.content_range.clone()];
+            let code_lines = if content.is_empty() {
+                vec![""]
+            } else {
+                content.lines().collect::<Vec<_>>()
+            };
+            for raw in code_lines {
+                for chunk in hard_wrap_preserving(raw, available) {
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.clone(), Style::default().fg(DIM)),
+                        Span::styled(chunk, base_style.fg(Color::Yellow)),
+                    ]));
+                }
+            }
+        }
+        MarkdownBlockKind::List => {
+            for raw in source[block.range.clone()].lines() {
+                if let Some((leading, marker, content, _ordered)) = markdown_list_item(raw) {
+                    let prefix = format!("{indent}{}{marker} ", " ".repeat(leading.min(12)));
+                    let spans = vec![MarkdownSpan::plain(Span::styled(
+                        prefix,
+                        Style::default().fg(ACCENT),
+                    ))];
+                    push_wrapped_markdown_line(
+                        lines,
+                        hyperlinks,
+                        spans,
+                        inline_markdown_spans(content, base_style),
+                        width,
+                    );
+                } else {
+                    let prefix = format!("{indent}  ");
+                    let spans = vec![MarkdownSpan::plain(Span::raw(prefix))];
+                    push_wrapped_markdown_line(
+                        lines,
+                        hyperlinks,
+                        spans,
+                        inline_markdown_spans(raw.trim(), base_style),
+                        width,
+                    );
+                }
+            }
+        }
+        MarkdownBlockKind::Quote => {
+            for raw in source[block.range.clone()].lines() {
+                let (depth, content) = markdown_quote_content(raw);
+                let spans = vec![MarkdownSpan::plain(Span::styled(
+                    format!("{indent}{}", "│ ".repeat(depth.max(1))),
+                    Style::default().fg(ACCENT),
+                ))];
+                push_wrapped_markdown_line(
+                    lines,
+                    hyperlinks,
+                    spans,
+                    inline_markdown_spans(content, base_style.fg(Color::Gray).italic()),
+                    width,
+                );
+            }
+        }
+        MarkdownBlockKind::Table => {
+            render_markdown_table(
+                lines,
+                hyperlinks,
+                &source[block.range.clone()],
+                indent,
+                base_style,
+                width,
+            );
+        }
+        MarkdownBlockKind::Rule => {
+            let available = width.saturating_sub(indent.width());
+            lines.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("─".repeat(available), Style::default().fg(DIM)),
+            ]));
+        }
+    }
+}
+
+fn markdown_quote_content(mut line: &str) -> (usize, &str) {
+    line = line.trim_start();
+    let mut depth = 0;
+    while let Some(rest) = line.strip_prefix('>') {
+        depth += 1;
+        line = rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    (depth, line)
+}
+
+#[derive(Clone, Copy)]
+enum MarkdownTableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+fn markdown_table_alignment(cell: &str) -> MarkdownTableAlignment {
+    let trimmed = cell.trim();
+    match (trimmed.starts_with(':'), trimmed.ends_with(':')) {
+        (true, true) => MarkdownTableAlignment::Center,
+        (false, true) => MarkdownTableAlignment::Right,
+        _ => MarkdownTableAlignment::Left,
+    }
+}
+
+fn render_markdown_table(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    source: &str,
+    indent: &str,
+    base_style: Style,
+    width: usize,
+) {
+    let raw_rows = source.lines().collect::<Vec<_>>();
+    if raw_rows.len() < 2 {
+        return;
+    }
+    let header = split_markdown_table_cells(raw_rows[0]);
+    let delimiter = split_markdown_table_cells(raw_rows[1]);
+    let column_count = header.len();
+    if column_count == 0 || delimiter.len() != column_count {
+        return;
+    }
+    let alignments = delimiter
+        .iter()
+        .map(|cell| markdown_table_alignment(cell))
+        .collect::<Vec<_>>();
+    let mut rows = vec![header];
+    rows.extend(
+        raw_rows
+            .iter()
+            .skip(2)
+            .map(|line| split_markdown_table_cells(line)),
+    );
+    for row in &mut rows {
+        row.resize(column_count, "");
+        row.truncate(column_count);
+    }
+
+    let overhead = column_count.saturating_mul(3).saturating_add(1);
+    let available = width.saturating_sub(indent.width());
+    let content_budget = available.saturating_sub(overhead);
+    if content_budget < column_count {
+        for raw in raw_rows {
+            let spans = vec![MarkdownSpan::plain(Span::raw(indent.to_string()))];
+            push_wrapped_markdown_line(
+                lines,
+                hyperlinks,
+                spans,
+                inline_markdown_spans(raw, base_style),
+                width,
+            );
+        }
+        return;
+    }
+
+    let preferred = (0..column_count)
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].width())
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    let mut widths = vec![1; column_count];
+    let mut remaining = content_budget - column_count;
+    while remaining > 0 {
+        let mut changed = false;
+        for column in 0..column_count {
+            if remaining == 0 {
+                break;
+            }
+            if widths[column] < preferred[column] {
+                widths[column] += 1;
+                remaining -= 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    append_markdown_table_row(
+        lines,
+        hyperlinks,
+        &rows[0],
+        &widths,
+        &alignments,
+        indent,
+        base_style.fg(ACCENT).bold(),
+    );
+    let separator = widths
+        .iter()
+        .map(|column_width| "─".repeat(column_width + 2))
+        .collect::<Vec<_>>()
+        .join("┼");
+    lines.push(Line::from(Span::styled(
+        format!("{indent}├{separator}┤"),
+        Style::default().fg(DIM),
+    )));
+    for row in rows.iter().skip(1) {
+        append_markdown_table_row(
+            lines,
+            hyperlinks,
+            row,
+            &widths,
+            &alignments,
+            indent,
+            base_style,
+        );
+    }
+}
+
+fn append_markdown_table_row(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    cells: &[&str],
+    widths: &[usize],
+    alignments: &[MarkdownTableAlignment],
+    indent: &str,
+    style: Style,
+) {
+    let wrapped = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| wrap_markdown_spans(inline_markdown_spans(cell, style), *width))
+        .collect::<Vec<_>>();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    for row_index in 0..height {
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled("│", Style::default().fg(DIM)),
+        ];
+        for (column, column_width) in widths.iter().enumerate() {
+            let content = wrapped[column].get(row_index).cloned().unwrap_or_default();
+            let content_width = content.spans.iter().map(Span::width).sum::<usize>();
+            let padding = column_width.saturating_sub(content_width);
+            let (left, right) = match alignments[column] {
+                MarkdownTableAlignment::Left => (0, padding),
+                MarkdownTableAlignment::Center => (padding / 2, padding - padding / 2),
+                MarkdownTableAlignment::Right => (padding, 0),
+            };
+            spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+            let link_offset = spans.iter().map(Span::width).sum::<usize>();
+            for link in content.hyperlinks {
+                hyperlinks.push(TranscriptHyperlink {
+                    line: lines.len(),
+                    start: link_offset + link.start,
+                    end: link_offset + link.end,
+                    url: link.url,
+                });
+            }
+            spans.extend(content.spans);
+            spans.push(Span::raw(format!("{} ", " ".repeat(right))));
+            spans.push(Span::styled("│", Style::default().fg(DIM)));
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
+#[derive(Clone)]
+struct MarkdownSpan {
+    span: Span<'static>,
+    hyperlink: Option<String>,
+}
+
+impl MarkdownSpan {
+    fn plain(span: Span<'static>) -> Self {
+        Self {
+            span,
+            hyperlink: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LineHyperlink {
+    start: usize,
+    end: usize,
+    url: String,
+}
+
+#[derive(Clone, Default)]
+struct WrappedMarkdownLine {
+    spans: Vec<Span<'static>>,
+    hyperlinks: Vec<LineHyperlink>,
+}
+
+fn push_wrapped_markdown_line(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<TranscriptHyperlink>,
+    mut spans: Vec<MarkdownSpan>,
+    content_spans: Vec<MarkdownSpan>,
+    width: usize,
+) {
+    spans.extend(content_spans);
+    let mut indent = Vec::new();
+    let mut content = Vec::new();
+    let mut reading_indent = true;
+
+    for markdown_span in spans {
+        let style = markdown_span.span.style;
+        let text = markdown_span.span.content.into_owned();
+        if reading_indent {
+            let content_start = text
+                .char_indices()
+                .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index));
+            match content_start {
+                Some(index) => {
+                    if index > 0 {
+                        indent.push(MarkdownSpan {
+                            span: Span::styled(text[..index].to_string(), style),
+                            hyperlink: markdown_span.hyperlink.clone(),
+                        });
+                    }
+                    content.push(MarkdownSpan {
+                        span: Span::styled(text[index..].to_string(), style),
+                        hyperlink: markdown_span.hyperlink,
+                    });
+                    reading_indent = false;
+                }
+                None => indent.push(MarkdownSpan {
+                    span: Span::styled(text, style),
+                    hyperlink: markdown_span.hyperlink,
+                }),
+            }
         } else {
-            ("", raw, base_style)
-        };
-        let mut spans = vec![Span::styled(format!("{indent}{prefix}"), base)];
-        spans.extend(inline_spans(content, base));
-        push_wrapped_line(lines, spans, width);
+            content.push(MarkdownSpan {
+                span: Span::styled(text, style),
+                hyperlink: markdown_span.hyperlink,
+            });
+        }
+    }
+
+    let indent_width = indent.iter().map(|span| span.span.width()).sum::<usize>();
+    let available = width.saturating_sub(indent_width).max(1);
+    let indent_spans = indent.into_iter().map(|span| span.span).collect::<Vec<_>>();
+    for wrapped in wrap_markdown_spans(content, available) {
+        let line = lines.len();
+        hyperlinks.extend(
+            wrapped
+                .hyperlinks
+                .into_iter()
+                .map(|link| TranscriptHyperlink {
+                    line,
+                    start: indent_width + link.start,
+                    end: indent_width + link.end,
+                    url: link.url,
+                }),
+        );
+        let mut row = indent_spans.clone();
+        row.extend(wrapped.spans);
+        lines.push(Line::from(row));
     }
 }
 
@@ -1001,21 +1981,31 @@ fn push_wrapped_line(lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>, 
 }
 
 fn wrap_styled_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    wrap_markdown_spans(spans.into_iter().map(MarkdownSpan::plain).collect(), width)
+        .into_iter()
+        .map(|line| line.spans)
+        .collect()
+}
+
+fn wrap_markdown_spans(spans: Vec<MarkdownSpan>, width: usize) -> Vec<WrappedMarkdownLine> {
     let width = width.max(1);
     let chars = spans
         .into_iter()
-        .flat_map(|span| {
-            let style = span.style;
-            span.content
+        .flat_map(|markdown_span| {
+            let style = markdown_span.span.style;
+            let hyperlink = markdown_span.hyperlink;
+            markdown_span
+                .span
+                .content
                 .into_owned()
                 .chars()
-                .map(move |ch| (ch, style))
+                .map(move |ch| (ch, style, hyperlink.clone()))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
     if chars.is_empty() {
-        return vec![Vec::new()];
+        return vec![WrappedMarkdownLine::default()];
     }
 
     let mut wrapped = Vec::new();
@@ -1061,23 +2051,58 @@ fn wrap_styled_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'s
         }
 
         let mut chunk: Vec<Span<'static>> = Vec::new();
-        for (ch, style) in &chars[start..end] {
+        let mut line_hyperlinks = Vec::new();
+        let mut current_hyperlink: Option<(String, usize)> = None;
+        let mut column = 0;
+        for (ch, style, hyperlink) in &chars[start..end] {
             if let Some(previous) = chunk.last_mut().filter(|span| span.style == *style) {
                 previous.content.to_mut().push(*ch);
             } else {
                 chunk.push(Span::styled(ch.to_string(), *style));
             }
+            if current_hyperlink.as_ref().map(|(url, _)| url) != hyperlink.as_ref() {
+                if let Some((url, link_start)) = current_hyperlink.take() {
+                    line_hyperlinks.push(LineHyperlink {
+                        start: link_start,
+                        end: column,
+                        url,
+                    });
+                }
+                current_hyperlink = hyperlink.clone().map(|url| (url, column));
+            }
+            column += ch.width().unwrap_or(0);
         }
-        wrapped.push(chunk);
+        if let Some((url, link_start)) = current_hyperlink {
+            line_hyperlinks.push(LineHyperlink {
+                start: link_start,
+                end: column,
+                url,
+            });
+        }
+        wrapped.push(WrappedMarkdownLine {
+            spans: chunk,
+            hyperlinks: line_hyperlinks,
+        });
         start = next;
     }
     wrapped
 }
 
+#[cfg(test)]
 fn inline_spans(input: &str, base: Style) -> Vec<Span<'static>> {
+    inline_markdown_spans(input, base)
+        .into_iter()
+        .map(|span| span.span)
+        .collect()
+}
+
+fn inline_markdown_spans(input: &str, base: Style) -> Vec<MarkdownSpan> {
     #[derive(Clone, Copy)]
     enum Marker {
+        BoldItalic,
         Bold,
+        Italic(char),
+        Strike,
         Code,
         Link,
     }
@@ -1086,39 +2111,81 @@ fn inline_spans(input: &str, base: Style) -> Vec<Span<'static>> {
     let mut rest = input;
     while !rest.is_empty() {
         let next = [
+            rest.find("***").map(|index| (index, Marker::BoldItalic)),
             rest.find("**").map(|index| (index, Marker::Bold)),
+            rest.find("~~").map(|index| (index, Marker::Strike)),
             rest.find('`').map(|index| (index, Marker::Code)),
             rest.find('[').map(|index| (index, Marker::Link)),
+            rest.find('*').map(|index| (index, Marker::Italic('*'))),
+            rest.find('_').map(|index| (index, Marker::Italic('_'))),
         ]
         .into_iter()
         .flatten()
         .min_by_key(|(index, _)| *index);
         let Some((index, marker)) = next else {
-            spans.push(Span::styled(rest.to_string(), base));
+            spans.push(MarkdownSpan::plain(Span::styled(rest.to_string(), base)));
             break;
         };
         if index > 0 {
-            spans.push(Span::styled(rest[..index].to_string(), base));
+            spans.push(MarkdownSpan::plain(Span::styled(
+                rest[..index].to_string(),
+                base,
+            )));
         }
         match marker {
-            Marker::Bold | Marker::Code => {
-                let delimiter = if matches!(marker, Marker::Bold) {
-                    "**"
-                } else {
-                    "`"
+            Marker::BoldItalic
+            | Marker::Bold
+            | Marker::Italic(_)
+            | Marker::Strike
+            | Marker::Code => {
+                let delimiter = match marker {
+                    Marker::BoldItalic => "***",
+                    Marker::Bold => "**",
+                    Marker::Italic('*') => "*",
+                    Marker::Italic('_') => "_",
+                    Marker::Strike => "~~",
+                    Marker::Code => "`",
+                    Marker::Italic(_) | Marker::Link => unreachable!(),
                 };
                 let after = &rest[index + delimiter.len()..];
-                if let Some(end) = after.find(delimiter) {
-                    let style = if matches!(marker, Marker::Bold) {
-                        base.add_modifier(Modifier::BOLD)
-                    } else {
-                        base.fg(Color::Yellow)
+                if let Marker::Italic(character) = marker {
+                    if !is_inline_italic_open(rest, index, character) {
+                        spans.push(MarkdownSpan::plain(Span::styled(
+                            delimiter.to_string(),
+                            base,
+                        )));
+                        rest = after;
+                        continue;
+                    }
+                }
+                let end = match marker {
+                    Marker::Italic(character) => find_inline_italic_close(after, character),
+                    _ => after.find(delimiter),
+                };
+                if let Some(end) = end {
+                    let style = match marker {
+                        Marker::BoldItalic => base.bold().italic(),
+                        Marker::Bold => base.bold(),
+                        Marker::Italic(_) => base.italic(),
+                        Marker::Strike => base.crossed_out(),
+                        Marker::Code => base.fg(Color::Yellow),
+                        Marker::Link => unreachable!(),
                     };
-                    spans.push(Span::styled(after[..end].to_string(), style));
+                    if matches!(marker, Marker::Code) {
+                        spans.push(MarkdownSpan::plain(Span::styled(
+                            after[..end].to_string(),
+                            style,
+                        )));
+                    } else {
+                        spans.extend(inline_markdown_spans(&after[..end], style));
+                    }
                     rest = &after[end + delimiter.len()..];
                 } else {
-                    spans.push(Span::styled(rest[index..].to_string(), base));
-                    break;
+                    spans.push(MarkdownSpan::plain(Span::styled(
+                        delimiter.to_string(),
+                        base,
+                    )));
+                    rest = after;
                 }
             }
             Marker::Link => {
@@ -1126,20 +2193,60 @@ fn inline_spans(input: &str, base: Style) -> Vec<Span<'static>> {
                 if let Some(label_end) = after_open.find("](") {
                     let after_url_open = &after_open[label_end + 2..];
                     if let Some(url_end) = after_url_open.find(')') {
-                        spans.push(Span::styled(
-                            after_open[..label_end].to_string(),
+                        let hyperlink = safe_terminal_url(&after_url_open[..url_end]);
+                        let mut label = inline_markdown_spans(
+                            &after_open[..label_end],
                             base.fg(Color::Blue).underlined(),
-                        ));
+                        );
+                        for span in &mut label {
+                            span.hyperlink = hyperlink.clone();
+                        }
+                        spans.extend(label);
                         rest = &after_url_open[url_end + 1..];
                         continue;
                     }
                 }
-                spans.push(Span::styled("[", base));
+                spans.push(MarkdownSpan::plain(Span::styled("[", base)));
                 rest = after_open;
             }
         }
     }
     spans
+}
+
+fn safe_terminal_url(url: &str) -> Option<String> {
+    let web_scheme = url.starts_with("https://") || url.starts_with("http://");
+    (web_scheme
+        && !url
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace()))
+    .then(|| url.to_string())
+}
+
+fn is_inline_italic_open(input: &str, index: usize, marker: char) -> bool {
+    let after = &input[index + marker.len_utf8()..];
+    if after.chars().next().is_none_or(char::is_whitespace) {
+        return false;
+    }
+    marker != '_'
+        || input[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric())
+}
+
+fn find_inline_italic_close(input: &str, marker: char) -> Option<usize> {
+    input.match_indices(marker).find_map(|(index, _)| {
+        let before = input[..index].chars().next_back()?;
+        if before.is_whitespace() {
+            return None;
+        }
+        let after = &input[index + marker.len_utf8()..];
+        if marker == '_' && after.chars().next().is_some_and(char::is_alphanumeric) {
+            return None;
+        }
+        Some(index)
+    })
 }
 
 fn slash_command_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
@@ -1160,15 +2267,27 @@ fn draw_composer(
     suggestions: &[(&str, &str)],
     area: Rect,
 ) {
-    let shortcut_hint = composer_shortcut_hint(area.width);
+    let shortcut_hint = if let Some(feedback) = &state.copy_feedback {
+        feedback.clone()
+    } else if let Some(copy_mode) = &state.copy_mode {
+        copy_mode_hint(copy_mode, area.width)
+    } else {
+        composer_shortcut_hint(area.width).into()
+    };
+    let hint_style = if state.copy_feedback.is_some() || state.copy_mode.is_some() {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(DIM)
+    };
     let block = Block::default()
-        .title(Line::styled(
-            format!(" {shortcut_hint} "),
-            Style::default().fg(DIM),
-        ))
+        .title(Line::styled(format!(" {shortcut_hint} "), hint_style))
         .title_alignment(Alignment::Right)
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(DIM))
+        .border_style(Style::default().fg(if state.copy_mode.is_some() {
+            ACCENT
+        } else {
+            DIM
+        }))
         .padding(Padding::new(2, 2, 1, 1))
         .style(Style::default().bg(COMPOSER_BACKGROUND));
     let inner = block.inner(area);
@@ -1250,7 +2369,7 @@ fn draw_composer(
         Paragraph::new(content).scroll((vertical_scroll as u16, 0)),
         input_area,
     );
-    if state.popup.is_none() && input_area.height > 0 {
+    if state.popup.is_none() && state.copy_mode.is_none() && input_area.height > 0 {
         let x = input_area.x.saturating_add(2).saturating_add(
             layout
                 .cursor_col
@@ -1263,12 +2382,39 @@ fn draw_composer(
     }
 }
 
+fn copy_mode_hint(copy_mode: &CopyMode, width: u16) -> String {
+    match copy_mode {
+        CopyMode::Answers { .. } => match width {
+            72.. => "COPY · ANSWERS  j/k move · Enter blocks · y copy · Esc close".into(),
+            48.. => "COPY · ANSWERS  j/k · Enter blocks · y copy · Esc".into(),
+            30.. => "COPY · ANSWERS  j/k · Enter · y".into(),
+            _ => "COPY · ANSWERS".into(),
+        },
+        CopyMode::Markdown { selected, .. } => {
+            let count = selected.len();
+            match width {
+                72.. => format!(
+                    "COPY · MARKDOWN  j/k move · Enter select · y copy ({count}) · Esc back"
+                ),
+                48.. => {
+                    format!("COPY · MARKDOWN  j/k · Enter select · y ({count}) · Esc")
+                }
+                30.. => format!("COPY · MARKDOWN  j/k · Enter · y ({count})"),
+                _ => format!("COPY · MARKDOWN ({count})"),
+            }
+        }
+    }
+}
+
 fn composer_shortcut_hint(width: u16) -> &'static str {
     match width {
-        80.. => "Tab mode · Ctrl+P/N history · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end",
-        60.. => "Tab mode · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end",
-        42.. => "Tab mode · Ctrl+O expand · Ctrl+G end",
-        26.. => "Tab mode · Ctrl+G end",
+        100.. => {
+            "Tab mode · Ctrl+Y copy · Ctrl+P/N history · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end"
+        }
+        80.. => "Tab mode · Ctrl+Y copy · Ctrl+K/J scroll · Ctrl+O expand · Ctrl+G end",
+        60.. => "Tab mode · Ctrl+Y copy · Ctrl+O expand · Ctrl+G end",
+        42.. => "Ctrl+Y copy · Ctrl+G end",
+        26.. => "Ctrl+Y copy",
         _ => "Tab mode",
     }
 }
@@ -1353,7 +2499,7 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
             } else {
                 (question.options.len() + usize::from(question.allow_other)) as u16
             };
-            (question_lines + body_lines + 5).clamp(8, 18)
+            (question_lines + body_lines + 4).clamp(6, 18)
         }
         Popup::Disconnected { reason, .. } => {
             (visual_line_count(reason, width) as u16 + 6).clamp(7, 14)
@@ -1643,15 +2789,16 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
         request.current + 1,
         request.questions.len()
     );
-    let block = panel_block(&title, 0);
+    let block = panel_block(&title, 1);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let question_height = visual_line_count(&question.question, area.width) as u16;
 
     if request.is_editing() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),
+                Constraint::Length(question_height),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
@@ -1724,7 +2871,7 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
+            Constraint::Length(question_height),
             Constraint::Length(option_count as u16),
             Constraint::Length(1),
         ])
@@ -2098,6 +3245,243 @@ mod tests {
     }
 
     #[test]
+    fn markdown_web_links_keep_safe_terminal_targets() {
+        let spans = inline_markdown_spans(
+            "[first link](https://example.com/a) and [second](http://example.org)",
+            Style::default(),
+        );
+        let targets = spans
+            .iter()
+            .filter_map(|span| span.hyperlink.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, ["https://example.com/a", "http://example.org"]);
+
+        for source in [
+            "[file](/tmp/file)",
+            "[mail](mailto:user@example.com)",
+            "[bad](https://example.com/unsafe url)",
+            "[bad](https://example.com/\u{1b}escape)",
+        ] {
+            assert!(inline_markdown_spans(source, Style::default())
+                .iter()
+                .all(|span| span.hyperlink.is_none()));
+        }
+    }
+
+    #[test]
+    fn markdown_link_ranges_survive_word_wrapping() {
+        let wrapped = wrap_markdown_spans(
+            inline_markdown_spans("[one two three](https://example.com)", Style::default()),
+            5,
+        );
+        let rows = wrapped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["one", "two", "three"]);
+        assert!(wrapped.iter().all(|line| {
+            line.hyperlinks
+                == [LineHyperlink {
+                    start: 0,
+                    end: line.spans.iter().map(Span::width).sum(),
+                    url: "https://example.com".into(),
+                }]
+        }));
+    }
+
+    #[test]
+    fn markdown_renderer_places_link_ranges_on_transcript_lines() {
+        let mut lines = Vec::new();
+        let mut hyperlinks = Vec::new();
+
+        append_markdown_with_hyperlinks(
+            &mut lines,
+            &mut hyperlinks,
+            "before [one two](https://example.com) after",
+            "  ",
+            Style::default(),
+            12,
+        );
+
+        assert_eq!(hyperlinks.len(), 2);
+        assert_eq!(hyperlinks[0].url, "https://example.com");
+        assert_eq!(hyperlinks[1].url, "https://example.com");
+        for link in hyperlinks {
+            let line = &lines[link.line];
+            let rendered = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(rendered[link.start..link.end]
+                .trim()
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic));
+        }
+    }
+
+    #[test]
+    fn terminal_overlay_collects_visible_link_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        buffer.set_string(2, 1, "link", Style::default().blue().underlined());
+        let overlay = terminal_hyperlink_overlay(
+            &buffer,
+            &[VisibleHyperlink {
+                row: 1,
+                start: 2,
+                end: 6,
+                url: "https://example.com".into(),
+            }],
+        );
+
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].url, "https://example.com");
+        assert_eq!(
+            overlay[0]
+                .cells
+                .iter()
+                .map(|cell| cell.cell.symbol())
+                .collect::<String>(),
+            "link"
+        );
+    }
+
+    #[test]
+    fn markdown_parser_finds_the_supported_top_level_blocks() {
+        let source = "# Title\n\nparagraph\ncontinued\n\n```rust\nfn main() {}\n```\n\n- one\n  - nested\n\n1. first\n2. second\n\n> quote\n> continued\n\n| Name | Score |\n| --- | ---: |\n| Ada | 10 |\n\n---";
+
+        let blocks = parse_markdown_blocks(source);
+        let kinds = blocks
+            .iter()
+            .map(|block| block.kind.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            [
+                MarkdownBlockKind::Heading(1),
+                MarkdownBlockKind::Paragraph,
+                MarkdownBlockKind::Code {
+                    language: "rust".into()
+                },
+                MarkdownBlockKind::List,
+                MarkdownBlockKind::List,
+                MarkdownBlockKind::Quote,
+                MarkdownBlockKind::Table,
+                MarkdownBlockKind::Rule,
+            ]
+        );
+        let code = &blocks[2];
+        assert_eq!(&source[code.content_range.clone()], "fn main() {}\n");
+        assert_eq!(&source[code.range.clone()], "```rust\nfn main() {}\n```");
+    }
+
+    #[test]
+    fn markdown_copy_ranges_skip_rules_and_strip_code_fences() {
+        let source = "# Heading\n\nParagraph\n\n---\n\n```rust\nfn main() {}\n```";
+        let copied = markdown_copy_ranges(source)
+            .into_iter()
+            .map(|range| &source[range])
+            .collect::<Vec<_>>();
+
+        assert_eq!(copied, ["# Heading", "Paragraph", "fn main() {}"]);
+    }
+
+    #[test]
+    fn markdown_inline_styles_cover_emphasis_strike_code_and_links() {
+        let spans = inline_spans(
+            "**bold** *italic* _also_ ***both*** ~~gone~~ `code` [link](https://example.com)",
+            Style::default(),
+        );
+        let span = |content: &str| spans.iter().find(|span| span.content == content).unwrap();
+
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span("italic").style.add_modifier.contains(Modifier::ITALIC));
+        assert!(span("also").style.add_modifier.contains(Modifier::ITALIC));
+        assert!(span("both").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span("both").style.add_modifier.contains(Modifier::ITALIC));
+        assert!(span("gone")
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+        assert_eq!(span("code").style.fg, Some(Color::Yellow));
+        assert_eq!(span("link").style.fg, Some(Color::Blue));
+        assert!(span("link")
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+
+        let identifiers = inline_spans("message_history_position = left * right", Style::default());
+        assert_eq!(
+            identifiers
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "message_history_position = left * right"
+        );
+    }
+
+    #[test]
+    fn markdown_renderer_distinguishes_blocks_and_fits_tables() {
+        let source = "# Main\n\n## Secondary\n\n#### Detail\n\n- bullet\n  2. nested\n\n> quoted text\n\n| Name | Long value |\n| :--- | ---: |\n| Ada | wrapped table content |\n\n```rust\nlet число = 10;\n```\n\n---";
+        let mut lines = Vec::new();
+
+        append_markdown(&mut lines, source, "  ", Style::default(), 32);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Main"));
+        assert!(rendered.contains("Secondary"));
+        assert!(rendered.contains("Detail"));
+        assert!(!rendered.contains('#'));
+        assert!(rendered.contains("• bullet"));
+        assert!(rendered.contains("2. nested"));
+        assert!(rendered.contains("│ quoted text"));
+        assert!(rendered.contains("Name"));
+        assert!(rendered.contains("Long"));
+        assert!(rendered.contains("rust"));
+        assert!(rendered.contains("let число = 10;"));
+        assert!(lines.iter().all(|line| line.width() <= 32));
+        let main = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "Main")
+            .unwrap();
+        assert_eq!(main.style.fg, Some(ACCENT));
+        assert!(main.style.add_modifier.contains(Modifier::BOLD));
+        assert!(main.style.add_modifier.contains(Modifier::UNDERLINED));
+        let secondary = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "Secondary")
+            .unwrap();
+        assert_eq!(secondary.style.fg, Some(ACCENT));
+        assert!(secondary.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!secondary.style.add_modifier.contains(Modifier::UNDERLINED));
+        let detail = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "Detail")
+            .unwrap();
+        assert_eq!(detail.style.fg, None);
+        assert!(detail.style.add_modifier.contains(Modifier::BOLD));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("table") && span.style.add_modifier.is_empty())
+        }));
+    }
+
+    #[test]
     fn styled_text_wraps_on_words_without_losing_styles() {
         let wrapped = wrap_styled_spans(
             vec![
@@ -2240,15 +3624,83 @@ mod tests {
         assert_eq!(buffer[(2, 2)].symbol(), "›");
         assert_eq!(buffer[(4, 2)].symbol(), "h");
         let top = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
-        assert!(top.contains("Tab mode · Ctrl+G end"));
+        assert!(top.contains("Ctrl+Y copy"));
     }
 
     #[test]
     fn composer_shortcuts_adapt_to_the_available_width() {
-        assert!(composer_shortcut_hint(80).contains("Ctrl+P/N history"));
-        assert!(!composer_shortcut_hint(60).contains("Ctrl+P/N"));
-        assert_eq!(composer_shortcut_hint(40), "Tab mode · Ctrl+G end");
+        assert!(composer_shortcut_hint(100).contains("Ctrl+P/N history"));
+        assert!(composer_shortcut_hint(80).contains("Ctrl+Y copy"));
+        assert!(!composer_shortcut_hint(80).contains("Ctrl+P/N"));
+        assert_eq!(composer_shortcut_hint(40), "Ctrl+Y copy");
         assert_eq!(composer_shortcut_hint(20), "Tab mode");
+    }
+
+    #[test]
+    fn copy_mode_keeps_the_composer_and_changes_only_its_help() {
+        let backend = ratatui::backend::TestBackend::new(80, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.composer.replace("preserved draft".into());
+        state.copy_mode = Some(CopyMode::Markdown {
+            block_index: 0,
+            markdown_index: 1,
+            selected: vec![0, 2],
+        });
+        let layout = layout_composer(&state.composer.text, state.composer.cursor, 74);
+
+        terminal
+            .draw(|frame| draw_composer(frame, &state, &layout, &[], frame.area()))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("COPY · MARKDOWN"));
+        assert!(rendered.contains("Enter select"));
+        assert!(rendered.contains("y copy (2)"));
+        assert!(rendered.contains("preserved draft"));
+        assert_eq!(state.composer.text, "preserved draft");
+    }
+
+    #[test]
+    fn copy_mode_highlights_the_answer_cursor_and_marked_blocks() {
+        let backend = ratatui::backend::TestBackend::new(48, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![TranscriptBlock::new(
+            BlockKind::Assistant,
+            "Codex",
+            "# Heading\n\nParagraph\n\n```rust\ncode\n```",
+        )];
+        state.copy_mode = Some(CopyMode::Markdown {
+            block_index: 0,
+            markdown_index: 1,
+            selected: vec![0],
+        });
+
+        terminal
+            .draw(|frame| draw_transcript(frame, &mut state, frame.area()))
+            .unwrap();
+
+        assert_eq!(state.transcript_markdown_ranges[0].len(), 3);
+        let buffer = terminal.backend().buffer();
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.bg == COPY_SELECTED_BACKGROUND));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.bg == COPY_CURSOR_BACKGROUND));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.bg == COPY_ANSWER_BACKGROUND));
     }
 
     #[test]
@@ -2373,6 +3825,59 @@ mod tests {
         assert_eq!(buffer[(49, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, COMPOSER_BACKGROUND);
         assert_eq!(buffer[(49, 3)].bg, COMPOSER_BACKGROUND);
+    }
+
+    #[test]
+    fn structured_choices_follow_the_question_and_keep_bottom_padding() {
+        let backend = ratatui::backend::TestBackend::new(100, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let request = UserInputRequest {
+            id: serde_json::json!(1),
+            questions: vec![crate::model::UserInputQuestion {
+                id: "release".into(),
+                header: "Release".into(),
+                question: "How should the release be prepared?".into(),
+                options: vec![
+                    crate::model::UserInputOption {
+                        label: "Full release".into(),
+                        description: "Commit and tag".into(),
+                    },
+                    crate::model::UserInputOption {
+                        label: "Prepare only".into(),
+                        description: "No tag".into(),
+                    },
+                    crate::model::UserInputOption {
+                        label: "Skip".into(),
+                        description: "Do nothing".into(),
+                    },
+                ],
+                allow_other: false,
+                secret: false,
+            }],
+            current: 0,
+            answers: vec![],
+            selected: 0,
+            input: Default::default(),
+            entering_other: false,
+        };
+
+        terminal
+            .draw(|frame| draw_user_input_panel(frame, &request, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(2).contains("How should the release be prepared?"));
+        assert!(row(3).contains("Full release"));
+        assert!(row(5).contains("Skip"));
+        assert!(row(6).contains("Enter answer"));
+        assert!(row(7).trim().is_empty());
+        assert_eq!(buffer[(0, 7)].bg, COMPOSER_BACKGROUND);
+        assert_eq!(buffer[(99, 7)].bg, COMPOSER_BACKGROUND);
     }
 
     #[test]

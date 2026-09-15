@@ -173,6 +173,18 @@ pub enum Popup {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyMode {
+    Answers {
+        block_index: usize,
+    },
+    Markdown {
+        block_index: usize,
+        markdown_index: usize,
+        selected: Vec<usize>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum ApprovalKind {
     Command,
@@ -442,6 +454,22 @@ pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> Compos
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptHyperlink {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleHyperlink {
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+}
+
 pub struct AppState {
     pub cwd: String,
     pub project: String,
@@ -464,6 +492,10 @@ pub struct AppState {
     pub transcript_cache_revision: u64,
     pub transcript_cache_lines: Vec<Line<'static>>,
     pub transcript_block_offsets: Vec<Option<usize>>,
+    pub transcript_markdown_ranges: Vec<Vec<(usize, usize)>>,
+    pub transcript_hyperlinks: Vec<TranscriptHyperlink>,
+    pub visible_hyperlinks: Vec<VisibleHyperlink>,
+    pub transcript_viewport_height: usize,
     pub composer: Composer,
     pub message_history: Vec<String>,
     pub message_history_position: Option<usize>,
@@ -476,6 +508,8 @@ pub struct AppState {
     pub transcript_max_scroll: usize,
     pub at_bottom: bool,
     pub new_output: bool,
+    pub copy_mode: Option<CopyMode>,
+    pub copy_feedback: Option<String>,
     pub show_reasoning: bool,
     pub quit: bool,
 }
@@ -537,6 +571,10 @@ impl AppState {
             transcript_cache_revision: 0,
             transcript_cache_lines: vec![],
             transcript_block_offsets: vec![],
+            transcript_markdown_ranges: vec![],
+            transcript_hyperlinks: vec![],
+            visible_hyperlinks: vec![],
+            transcript_viewport_height: 0,
             composer: Composer::default(),
             message_history: vec![],
             message_history_position: None,
@@ -549,6 +587,8 @@ impl AppState {
             transcript_max_scroll: 0,
             at_bottom: true,
             new_output: false,
+            copy_mode: None,
+            copy_feedback: None,
             show_reasoning,
             quit: false,
         }
@@ -693,6 +733,7 @@ impl AppState {
 
     pub fn clear_blocks(&mut self) {
         self.blocks.clear();
+        self.copy_mode = None;
         self.mark_transcript_dirty();
     }
 
@@ -701,6 +742,9 @@ impl AppState {
     }
 
     pub fn present_server_prompt(&mut self, prompt: ServerPrompt) {
+        if self.copy_mode.take().is_some() {
+            self.mark_transcript_dirty();
+        }
         if matches!(self.popup, Some(Popup::Approval(_) | Popup::UserInput(_))) {
             self.pending_server_requests.push_back(prompt);
             return;
