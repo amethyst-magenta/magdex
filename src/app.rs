@@ -53,6 +53,19 @@ enum Pending {
     Interrupt,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlCAction {
+    ClearedComposer,
+    Interrupt,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ThreadListTarget {
     Popup,
@@ -986,20 +999,22 @@ impl Controller {
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         let key = normalize_control_shortcut(key);
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.state.turn_id.is_some() {
+            if prepare_control_c(&mut self.state) == ControlCAction::Interrupt {
                 return self.interrupt();
-            }
-            if !self.state.composer.text.is_empty() || !self.state.image_attachments.is_empty() {
-                self.state.composer.clear();
-                self.state.image_attachments.clear();
-            } else {
-                self.state.quit = true;
             }
             return Ok(());
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
             self.paste_clipboard();
+            return Ok(());
+        }
+
+        if let Some(direction) = control_scroll_direction(key) {
+            match direction {
+                ScrollDirection::Up => self.scroll_up(3),
+                ScrollDirection::Down => self.scroll_down(3),
+            }
             return Ok(());
         }
 
@@ -1019,8 +1034,6 @@ impl Controller {
             match key.code {
                 KeyCode::Char('p') => self.state.previous_message(),
                 KeyCode::Char('n') => self.state.next_message(),
-                KeyCode::Char('k') => self.scroll_up(3),
-                KeyCode::Char('j') => self.scroll_down(3),
                 KeyCode::Char('g') => self.state.jump_to_bottom(),
                 KeyCode::Char('o') => toggle_latest_command(&mut self.state),
                 _ => {}
@@ -1698,6 +1711,30 @@ fn toggle_latest_command(state: &mut AppState) {
         if expanded {
             state.jump_to_bottom();
         }
+    }
+}
+
+fn prepare_control_c(state: &mut AppState) -> ControlCAction {
+    if !state.composer.text.is_empty() || !state.image_attachments.is_empty() {
+        state.composer.clear();
+        state.image_attachments.clear();
+        ControlCAction::ClearedComposer
+    } else if state.turn_id.is_some() {
+        ControlCAction::Interrupt
+    } else {
+        state.quit = true;
+        ControlCAction::Quit
+    }
+}
+
+fn control_scroll_direction(key: KeyEvent) -> Option<ScrollDirection> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match normalize_control_shortcut(key).code {
+        KeyCode::Char('k') => Some(ScrollDirection::Up),
+        KeyCode::Char('j') => Some(ScrollDirection::Down),
+        _ => None,
     }
 }
 
@@ -3092,6 +3129,40 @@ mod tests {
 
         let text = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::NONE);
         assert_eq!(normalize_control_shortcut(text).code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn control_c_clears_composer_before_interrupting_or_quitting() {
+        let mut state = AppState::new("/project".into(), true);
+        state.turn_id = Some("turn-1".into());
+        state.composer.replace("draft".into());
+
+        assert_eq!(
+            prepare_control_c(&mut state),
+            ControlCAction::ClearedComposer
+        );
+        assert!(state.composer.text.is_empty());
+        assert_eq!(prepare_control_c(&mut state), ControlCAction::Interrupt);
+
+        state.turn_id = None;
+        assert_eq!(prepare_control_c(&mut state), ControlCAction::Quit);
+        assert!(state.quit);
+    }
+
+    #[test]
+    fn control_scroll_is_distinct_from_plain_menu_navigation() {
+        for (character, direction) in [
+            ('k', ScrollDirection::Up),
+            ('л', ScrollDirection::Up),
+            ('j', ScrollDirection::Down),
+            ('о', ScrollDirection::Down),
+        ] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+            assert_eq!(control_scroll_direction(key), Some(direction));
+        }
+
+        let plain = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(control_scroll_direction(plain), None);
     }
 
     #[test]
