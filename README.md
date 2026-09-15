@@ -22,7 +22,8 @@ cd ~/code/my-project
 magdex
 ```
 
-Choose one of the recent conversations from the current directory:
+Choose one of the recent conversations from the current directory. Press `Tab` in
+the picker to include conversations from every working directory:
 
 ```bash
 magdex resume
@@ -33,7 +34,7 @@ magdex resume
 | Key | Action |
 | --- | --- |
 | `Enter` | Send |
-| `Alt+Enter` | Insert a newline |
+| `Shift+Enter` | Insert a newline |
 | `Ctrl+V` | Paste text or attach an image from the system clipboard |
 | `Ctrl+C` | Interrupt; clear input; quit when idle and empty |
 | `Ctrl+P` / `Ctrl+N` | Recall older/newer messages in the composer |
@@ -42,6 +43,7 @@ magdex resume
 | `Ctrl+G` | Jump to the latest output |
 | Mouse wheel | Scroll transcript |
 | `Ctrl+O` | Expand the current command output |
+| `Tab` | Toggle Default/Plan; switch current/all inside a resume picker |
 | `Esc` | Close the bottom panel (or cancel an approval) |
 | `↑` / `↓` or `j` / `k` | Choose an answer when Codex asks a structured question |
 
@@ -54,8 +56,10 @@ The textual commands are `/new`, `/resume`, `/mode`, `/model`, `/reasoning`,
 selecting one jumps to it in the transcript.
 Typing `/` in the composer shows and filters the available commands.
 `/new` switches to a new thread without deleting the current one; `/resume`
-switches to a stored thread. Authentication is checked on startup and required
-automatically when no Codex account is available.
+switches to a stored thread. Its picker starts with the current directory and can
+show every directory with `Tab`. Authentication is checked on startup and required
+automatically when no Codex account is available. A directory without an existing
+trust decision must be explicitly trusted before Magdex starts or resumes a thread.
 
 Frontend-only settings may be placed in `~/.config/magdex/config.toml`:
 
