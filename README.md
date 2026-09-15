@@ -36,7 +36,7 @@ magdex resume
 | `Enter` | Send |
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+V` | Paste text or attach an image from the system clipboard |
-| `Ctrl+C` | Interrupt; clear input; quit when idle and empty |
+| `Ctrl+C` | Clear input; interrupt when empty; quit when idle and empty |
 | `Ctrl+P` / `Ctrl+N` | Recall older/newer messages in the composer |
 | `↑` / `↓` | Move between composer lines |
 | `Ctrl+K` / `Ctrl+J` | Smoothly scroll transcript up/down |
