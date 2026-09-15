@@ -18,7 +18,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    Terminal,
+};
 
 use app::{normalize_control_shortcut, Controller};
 use config::ClientConfig;
@@ -76,9 +79,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = redraw.tick(), if dirty => {
                 if full_redraw {
-                    // Invalidate Ratatui's previous frame without clearing the
-                    // physical terminal. A real clear briefly blanks Zellij.
-                    guard.terminal.swap_buffers();
+                    invalidate_previous_frame(&mut guard.terminal);
                     full_redraw = false;
                 }
                 guard
@@ -213,6 +214,17 @@ fn event_requests_full_redraw(event: &Event, zellij_workaround: bool) -> bool {
     }
 }
 
+fn invalidate_previous_frame<B: Backend>(terminal: &mut Terminal<B>) {
+    // The current buffer is empty between frames. Mark it as different from
+    // every normally rendered cell before swapping it into the previous slot,
+    // so the next diff also writes blank cells that must erase stale output.
+    // This avoids a physical clear, which briefly blanks Zellij.
+    for cell in &mut terminal.current_buffer_mut().content {
+        cell.set_skip(true);
+    }
+    terminal.swap_buffers();
+}
+
 fn running_in_zellij() -> bool {
     std::env::var_os("ZELLIJ").is_some() || std::env::var_os("ZELLIJ_SESSION_NAME").is_some()
 }
@@ -283,8 +295,12 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
 
-    use super::{event_requests_full_redraw, next_working_redraw, WORKING_FRAME_MILLIS};
+    use super::{
+        event_requests_full_redraw, invalidate_previous_frame, next_working_redraw,
+        WORKING_FRAME_MILLIS,
+    };
 
     #[test]
     fn working_redraw_aligns_with_turn_frames() {
@@ -321,5 +337,16 @@ mod tests {
         });
         assert!(!event_requests_full_redraw(&wheel, true));
         assert!(event_requests_full_redraw(&Event::Resize(120, 40), false));
+    }
+
+    #[test]
+    fn full_redraw_overwrites_stale_terminal_cells() {
+        let backend = TestBackend::with_lines(["stale"]);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        invalidate_previous_frame(&mut terminal);
+        terminal.draw(|_| {}).unwrap();
+
+        assert_eq!(terminal.backend().buffer(), TestBackend::new(5, 1).buffer());
     }
 }
