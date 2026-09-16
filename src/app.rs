@@ -13,6 +13,7 @@ use crate::{
         ModelInfo, Popup, ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
         TrustDirectoryPrompt, UserInputOption, UserInputQuestion, UserInputRequest,
     },
+    notification::Notifier,
     rpc::{Incoming, RpcClient},
     ui::markdown_copy_ranges,
 };
@@ -84,6 +85,7 @@ pub struct Controller {
     pub state: AppState,
     rpc: RpcClient,
     pending: HashMap<u64, Pending>,
+    notifier: Notifier,
     default_mode_request_user_input: bool,
     debug: bool,
     startup_resume_pending: bool,
@@ -94,6 +96,7 @@ impl Controller {
         cwd: String,
         show_reasoning: bool,
         default_mode_request_user_input: bool,
+        notifications: bool,
         debug: bool,
         resume_on_start: bool,
     ) -> Result<Self> {
@@ -103,6 +106,7 @@ impl Controller {
             state,
             rpc,
             pending: HashMap::new(),
+            notifier: Notifier::new(notifications),
             default_mode_request_user_input,
             debug,
             startup_resume_pending: resume_on_start,
@@ -135,15 +139,20 @@ impl Controller {
         match incoming {
             Incoming::Message(message) => self.handle_rpc_message(message),
             Incoming::Disconnected(reason) => {
-                self.state.turn_id = None;
-                self.state.turn_started_at = None;
-                self.state.popup = Some(Popup::Disconnected {
-                    reason,
-                    selected: 0,
-                });
+                self.backend_disconnected(reason);
                 Ok(())
             }
         }
+    }
+
+    pub fn backend_disconnected(&mut self, reason: String) {
+        self.notify_action_required("Codex backend disconnected");
+        self.state.turn_id = None;
+        self.state.turn_started_at = None;
+        self.state.popup = Some(Popup::Disconnected {
+            reason,
+            selected: 0,
+        });
     }
 
     fn handle_rpc_message(&mut self, message: Value) -> Result<()> {
@@ -1448,6 +1457,11 @@ impl Controller {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         if method == "item/tool/requestUserInput" {
             if let Some(request) = parse_user_input_request(id.clone(), &params) {
+                let detail = request
+                    .current_question()
+                    .map(|question| question.question.as_str())
+                    .unwrap_or("Codex asked a question");
+                self.notify_action_required(detail);
                 self.state
                     .present_server_prompt(ServerPrompt::UserInput(request));
             } else {
@@ -1518,6 +1532,7 @@ impl Controller {
             params,
             selected: 0,
         };
+        self.notify_action_required(&approval.title);
         // Server prompts take precedence over navigation popups: the server is
         // blocked until the client answers them.
         self.state
@@ -1538,12 +1553,20 @@ impl Controller {
                 }
             }
             "turn/completed" => {
-                if let Some(error) = params
+                let error = params
                     .pointer("/turn/error/message")
-                    .and_then(Value::as_str)
-                {
+                    .and_then(Value::as_str);
+                if let Some(error) = error {
                     self.state
                         .push(TranscriptBlock::new(BlockKind::Error, "Error", error));
+                }
+                match params.pointer("/turn/status").and_then(Value::as_str) {
+                    Some("completed") => self.notify_response_ready(),
+                    Some("failed") => self.notify_turn_failed(),
+                    Some("interrupted") | Some("inProgress") => {}
+                    Some(_) => {}
+                    None if error.is_some() => self.notify_turn_failed(),
+                    None => self.notify_response_ready(),
                 }
                 let duration_ms = params
                     .pointer("/turn/durationMs")
@@ -1657,6 +1680,22 @@ impl Controller {
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn set_terminal_focused(&self, focused: bool) {
+        self.notifier.set_terminal_focused(focused);
+    }
+
+    fn notify_action_required(&self, detail: &str) {
+        self.notifier.action_required(&self.state.project, detail);
+    }
+
+    fn notify_response_ready(&self) {
+        self.notifier.response_ready(&self.state.project);
+    }
+
+    fn notify_turn_failed(&self) {
+        self.notifier.turn_failed(&self.state.project);
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {

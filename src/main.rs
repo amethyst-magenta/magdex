@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod model;
+mod notification;
 mod rpc;
 mod ui;
 
@@ -10,9 +11,10 @@ use anyhow::{bail, Context, Result};
 use crossterm::{
     cursor::{MoveTo, RestorePosition, SavePosition},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, EventStream,
-        KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute, queue,
     style::{Attribute, Colors, Print, ResetColor, SetAttribute, SetColors},
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
         cwd,
         config.show_reasoning,
         config.default_mode_request_user_input,
+        config.notifications,
         debug,
         resume_on_start,
     )
@@ -149,6 +152,8 @@ async fn main() -> Result<()> {
                     }
                     Some(Ok(Event::Mouse(mouse))) if config.mouse => controller.handle_mouse(mouse),
                     Some(Ok(Event::Paste(text))) => controller.handle_paste(&text),
+                    Some(Ok(Event::FocusGained)) => controller.set_terminal_focused(true),
+                    Some(Ok(Event::FocusLost)) => controller.set_terminal_focused(false),
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
@@ -170,10 +175,9 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     rpc_open = false;
-                    controller.state.popup = Some(model::Popup::Disconnected {
-                        reason: "Codex backend event channel closed".into(),
-                        selected: 0,
-                    });
+                    controller.backend_disconnected(
+                        "Codex backend event channel closed".into(),
+                    );
                 }
                 dirty = true;
             }
@@ -347,7 +351,8 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableFocusChange
         )?;
         if mouse {
             // Normal tracking reports clicks and wheel events without the
@@ -373,6 +378,7 @@ impl TerminalGuard {
         }
         execute!(
             self.terminal.backend_mut(),
+            DisableFocusChange,
             DisableBracketedPaste,
             PopKeyboardEnhancementFlags,
             LeaveAlternateScreen

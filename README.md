@@ -8,7 +8,7 @@ and thread storage remain Codex responsibilities.
 ## Build
 
 Requirements: a recent Rust toolchain and the official `codex` executable in
-`PATH`.
+`PATH`. Desktop notifications also require `notify-send`.
 
 ```bash
 cargo build --release
@@ -76,12 +76,16 @@ Frontend-only settings may be placed in `~/.config/magdex/config.toml`:
 show_reasoning = true
 mouse = true
 default_mode_request_user_input = true
+notifications = true
 ```
 
 - `show_reasoning` shows or hides streamed reasoning summaries.
 - `mouse` enables terminal mouse capture and wheel scrolling.
 - `default_mode_request_user_input` lets Codex ask structured questions in
   Default mode as well as Plan mode.
+- `notifications` sends desktop notifications through `notify-send` when hidden
+  Magdex needs user input or finishes a turn. Magdex checks Zellij pane/tab state
+  and the active Niri workspace when available, falling back to terminal focus.
 
 Codex model defaults, sandbox policy, approvals, MCP, skills, and web settings
 belong in the normal Codex configuration, not this file.

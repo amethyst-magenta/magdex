@@ -8,6 +8,7 @@ pub struct ClientConfig {
     pub show_reasoning: bool,
     pub mouse: bool,
     pub default_mode_request_user_input: bool,
+    pub notifications: bool,
 }
 
 impl Default for ClientConfig {
@@ -16,6 +17,7 @@ impl Default for ClientConfig {
             show_reasoning: true,
             mouse: true,
             default_mode_request_user_input: true,
+            notifications: true,
         }
     }
 }
