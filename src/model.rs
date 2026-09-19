@@ -285,6 +285,7 @@ impl UserInputRequest {
 pub struct Composer {
     pub text: String,
     pub cursor: usize,
+    selection_anchor: Option<usize>,
     preferred_column: Option<usize>,
 }
 
@@ -294,6 +295,7 @@ pub(crate) struct ComposerLayout {
     pub cursor_row: usize,
     pub cursor_col: usize,
     cursor_positions: Vec<(usize, usize, usize)>,
+    pub(crate) line_source_indices: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,12 +313,14 @@ pub struct QueuedTurn {
 
 impl Composer {
     pub fn insert(&mut self, ch: char) {
+        self.delete_selection();
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.preferred_column = None;
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        self.delete_selection();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.preferred_column = None;
@@ -327,6 +331,9 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -341,6 +348,9 @@ impl Composer {
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor >= self.text.len() {
             return;
         }
@@ -353,16 +363,34 @@ impl Composer {
         self.preferred_column = None;
     }
 
-    pub fn left(&mut self) {
+    pub fn move_left(&mut self, selecting: bool) {
+        if !selecting {
+            if let Some(range) = self.selection_range() {
+                self.cursor = range.start;
+                self.selection_anchor = None;
+                self.preferred_column = None;
+                return;
+            }
+        }
+        self.begin_movement(selecting);
         self.cursor = self.text[..self.cursor]
             .char_indices()
             .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
-        self.preferred_column = None;
+        self.finish_movement(selecting, false);
     }
 
-    pub fn right(&mut self) {
+    pub fn move_right(&mut self, selecting: bool) {
+        if !selecting {
+            if let Some(range) = self.selection_range() {
+                self.cursor = range.end;
+                self.selection_anchor = None;
+                self.preferred_column = None;
+                return;
+            }
+        }
+        self.begin_movement(selecting);
         if self.cursor < self.text.len() {
             self.cursor = self.text[self.cursor..]
                 .char_indices()
@@ -370,18 +398,63 @@ impl Composer {
                 .map(|(offset, _)| self.cursor + offset)
                 .unwrap_or(self.text.len());
         }
-        self.preferred_column = None;
+        self.finish_movement(selecting, false);
     }
 
-    pub fn up(&mut self, width: usize) {
-        self.move_vertical(width, -1);
+    pub fn move_word_left(&mut self, selecting: bool) {
+        self.begin_movement(selecting);
+        let before = &self.text[..self.cursor];
+        let without_whitespace = before.trim_end_matches(char::is_whitespace);
+        let word_start = without_whitespace
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        self.cursor = word_start;
+        self.finish_movement(selecting, false);
     }
 
-    pub fn down(&mut self, width: usize) {
-        self.move_vertical(width, 1);
+    pub fn move_word_right(&mut self, selecting: bool) {
+        self.begin_movement(selecting);
+        let after = &self.text[self.cursor..];
+        let word_end = after
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, _)| index)
+            .unwrap_or(after.len());
+        let after_word = &after[word_end..];
+        let whitespace_end = after_word
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(index, _)| index)
+            .unwrap_or(after_word.len());
+        self.cursor += word_end + whitespace_end;
+        self.finish_movement(selecting, false);
     }
 
-    fn move_vertical(&mut self, width: usize, direction: isize) {
+    pub fn move_to_start(&mut self, selecting: bool) {
+        self.begin_movement(selecting);
+        self.cursor = 0;
+        self.finish_movement(selecting, false);
+    }
+
+    pub fn move_to_end(&mut self, selecting: bool) {
+        self.begin_movement(selecting);
+        self.cursor = self.text.len();
+        self.finish_movement(selecting, false);
+    }
+
+    pub fn move_up(&mut self, width: usize, selecting: bool) {
+        self.move_vertical(width, -1, selecting);
+    }
+
+    pub fn move_down(&mut self, width: usize, selecting: bool) {
+        self.move_vertical(width, 1, selecting);
+    }
+
+    fn move_vertical(&mut self, width: usize, direction: isize, selecting: bool) {
+        self.begin_movement(selecting);
         let layout = layout_composer(&self.text, self.cursor, width);
         let target_row = if direction < 0 {
             layout.cursor_row.checked_sub(1)
@@ -392,6 +465,7 @@ impl Composer {
                 .filter(|row| *row < layout.lines.len())
         };
         let Some(target_row) = target_row else {
+            self.finish_movement(selecting, true);
             return;
         };
         let target_column = self.preferred_column.unwrap_or(layout.cursor_col);
@@ -404,16 +478,56 @@ impl Composer {
             self.cursor = *cursor;
             self.preferred_column = Some(target_column);
         }
+        self.finish_movement(selecting, true);
+    }
+
+    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.selection_anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    fn begin_movement(&mut self, selecting: bool) {
+        if selecting {
+            self.selection_anchor.get_or_insert(self.cursor);
+        } else {
+            self.selection_anchor = None;
+        }
+    }
+
+    fn finish_movement(&mut self, selecting: bool, vertical: bool) {
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+        if !vertical {
+            self.preferred_column = None;
+        }
+        if !selecting {
+            self.selection_anchor = None;
+        }
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            self.selection_anchor = None;
+            return false;
+        };
+        self.cursor = range.start;
+        self.text.replace_range(range, "");
+        self.selection_anchor = None;
+        self.preferred_column = None;
+        true
     }
 
     pub fn replace(&mut self, text: String) {
         self.text = text;
         self.cursor = self.text.len();
+        self.selection_anchor = None;
         self.preferred_column = None;
     }
 
     pub fn clear(&mut self) -> String {
         self.cursor = 0;
+        self.selection_anchor = None;
         self.preferred_column = None;
         std::mem::take(&mut self.text)
     }
@@ -422,6 +536,7 @@ impl Composer {
 pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> ComposerLayout {
     let width = width.max(1);
     let mut lines = vec![String::new()];
+    let mut line_source_indices = vec![Vec::new()];
     let mut cursor_positions = Vec::new();
     let mut row = 0;
     let mut col = 0;
@@ -443,12 +558,14 @@ pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> Compos
                 row += 1;
                 col = 0;
                 lines.push(String::new());
+                line_source_indices.push(Vec::new());
             }
         }
         if ch != '\n' && col > 0 && col + char_width > width {
             row += 1;
             col = 0;
             lines.push(String::new());
+            line_source_indices.push(Vec::new());
             if ch.is_whitespace() {
                 cursor_positions.push((index, row, col));
                 if index == cursor {
@@ -466,13 +583,16 @@ pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> Compos
             row += 1;
             col = 0;
             lines.push(String::new());
+            line_source_indices.push(Vec::new());
         } else {
             lines[row].push(ch);
+            line_source_indices[row].push(index);
             col += char_width;
             if col == width && index + ch.len_utf8() == cursor {
                 row += 1;
                 col = 0;
                 lines.push(String::new());
+                line_source_indices.push(Vec::new());
                 cursor_position = Some((row, col));
             }
         }
@@ -483,6 +603,7 @@ pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> Compos
             row += 1;
             col = 0;
             lines.push(String::new());
+            line_source_indices.push(Vec::new());
         }
         cursor_position = Some((row, col));
     }
@@ -494,6 +615,7 @@ pub(crate) fn layout_composer(text: &str, cursor: usize, width: usize) -> Compos
         cursor_row,
         cursor_col,
         cursor_positions,
+        line_source_indices,
     }
 }
 
@@ -885,7 +1007,7 @@ mod tests {
         let mut composer = Composer::default();
         composer.insert('я');
         composer.insert('🙂');
-        composer.left();
+        composer.move_left(false);
         composer.backspace();
         assert_eq!(composer.text, "🙂");
         assert_eq!(composer.cursor, 0);
@@ -902,19 +1024,19 @@ mod tests {
         let mut composer = Composer::default();
         composer.insert_str("alpha beta gamma");
 
-        composer.up(10);
+        composer.move_up(10, false);
         assert_eq!(composer.cursor, "alpha".len());
-        composer.down(10);
+        composer.move_down(10, false);
         assert_eq!(composer.cursor, composer.text.len());
 
         composer.replace("abcd\nef\nwxyz".into());
-        composer.up(20);
+        composer.move_up(20, false);
         assert_eq!(composer.cursor, "abcd\nef".len());
-        composer.up(20);
+        composer.move_up(20, false);
         assert_eq!(composer.cursor, "abcd".len());
-        composer.down(20);
+        composer.move_down(20, false);
         assert_eq!(composer.cursor, "abcd\nef".len());
-        composer.down(20);
+        composer.move_down(20, false);
         assert_eq!(composer.cursor, composer.text.len());
     }
 
@@ -922,13 +1044,50 @@ mod tests {
     fn composer_arrows_do_nothing_on_a_single_visual_line() {
         let mut composer = Composer::default();
         composer.insert_str("draft");
-        composer.left();
+        composer.move_left(false);
         let cursor = composer.cursor;
 
-        composer.up(80);
-        composer.down(80);
+        composer.move_up(80, false);
+        composer.move_down(80, false);
 
         assert_eq!(composer.cursor, cursor);
+    }
+
+    #[test]
+    fn composer_moves_by_words_and_document_boundaries() {
+        let mut composer = Composer::default();
+        composer.insert_str("один  two\nthree");
+
+        composer.move_word_left(false);
+        assert_eq!(composer.cursor, "один  two\n".len());
+        composer.move_word_left(false);
+        assert_eq!(composer.cursor, "один  ".len());
+        composer.move_word_right(false);
+        assert_eq!(composer.cursor, "один  two\n".len());
+        composer.move_to_start(false);
+        assert_eq!(composer.cursor, 0);
+        composer.move_to_end(false);
+        assert_eq!(composer.cursor, composer.text.len());
+    }
+
+    #[test]
+    fn composer_selection_is_replaced_or_deleted() {
+        let mut composer = Composer::default();
+        composer.insert_str("alpha beta");
+        composer.move_word_left(true);
+        assert_eq!(
+            composer.selection_range(),
+            Some("alpha ".len().."alpha beta".len())
+        );
+
+        composer.insert_str("gamma");
+        assert_eq!(composer.text, "alpha gamma");
+        assert_eq!(composer.selection_range(), None);
+
+        composer.move_to_start(true);
+        composer.delete();
+        assert!(composer.text.is_empty());
+        assert_eq!(composer.cursor, 0);
     }
 
     #[test]

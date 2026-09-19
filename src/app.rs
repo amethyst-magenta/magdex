@@ -13,10 +13,10 @@ use serde_json::{json, Value};
 use crate::{
     model::{
         ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
-        CommandAction, CommandActionKind, ContextUsage, CopyMode, FileChange, FileChangeKind,
-        ImageAttachment, ModelInfo, Popup, QueuedTurn, QuotaUsage, QuotaWindow, ResumePicker,
-        ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt,
-        UserInputOption, UserInputQuestion, UserInputRequest,
+        CommandAction, CommandActionKind, Composer, ContextUsage, CopyMode, FileChange,
+        FileChangeKind, ImageAttachment, ModelInfo, Popup, QueuedTurn, QuotaUsage, QuotaWindow,
+        ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
+        TrustDirectoryPrompt, UserInputOption, UserInputQuestion, UserInputRequest,
     },
     notification::Notifier,
     rpc::{Incoming, RpcClient},
@@ -1283,6 +1283,10 @@ impl Controller {
             return self.handle_resume_picker_key(key);
         }
 
+        if handle_composer_arrow(&mut self.state.composer, key, self.state.composer_width) {
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('p') => self.state.previous_message(),
@@ -1302,10 +1306,6 @@ impl Controller {
             KeyCode::Char(ch) => self.state.composer.insert(ch),
             KeyCode::Backspace => self.state.composer.backspace(),
             KeyCode::Delete => self.state.composer.delete(),
-            KeyCode::Left => self.state.composer.left(),
-            KeyCode::Right => self.state.composer.right(),
-            KeyCode::Up => self.state.composer.up(self.state.composer_width),
-            KeyCode::Down => self.state.composer.down(self.state.composer_width),
             _ => {}
         }
         Ok(())
@@ -1544,6 +1544,9 @@ impl Controller {
         };
         let key = normalize_approval_key(key, current.entering_feedback);
         if current.entering_feedback {
+            if handle_composer_arrow(&mut current.feedback, key, self.state.composer_width) {
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Esc => {
                     current.entering_feedback = false;
@@ -1561,10 +1564,6 @@ impl Controller {
                 }
                 KeyCode::Backspace => current.feedback.backspace(),
                 KeyCode::Delete => current.feedback.delete(),
-                KeyCode::Left => current.feedback.left(),
-                KeyCode::Right => current.feedback.right(),
-                KeyCode::Up => current.feedback.up(self.state.composer_width),
-                KeyCode::Down => current.feedback.down(self.state.composer_width),
                 _ => {}
             }
             return Ok(());
@@ -1669,6 +1668,9 @@ impl Controller {
         let editing = request.is_editing();
 
         if editing {
+            if handle_composer_arrow(&mut request.input, key, self.state.composer_width) {
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Esc if request.entering_other => {
                     request.entering_other = false;
@@ -1692,8 +1694,6 @@ impl Controller {
                 }
                 KeyCode::Backspace => request.input.backspace(),
                 KeyCode::Delete => request.input.delete(),
-                KeyCode::Left => request.input.left(),
-                KeyCode::Right => request.input.right(),
                 _ => {}
             }
             return Ok(());
@@ -2383,6 +2383,26 @@ fn control_scroll_direction(key: KeyEvent) -> Option<ScrollDirection> {
         KeyCode::Char('j') => Some(ScrollDirection::Down),
         _ => None,
     }
+}
+
+fn handle_composer_arrow(composer: &mut Composer, key: KeyEvent, width: usize) -> bool {
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Left, false) => composer.move_left(selecting),
+        (KeyCode::Right, false) => composer.move_right(selecting),
+        (KeyCode::Up, false) => composer.move_up(width, selecting),
+        (KeyCode::Down, false) => composer.move_down(width, selecting),
+        (KeyCode::Left, true) => composer.move_word_left(selecting),
+        (KeyCode::Right, true) => composer.move_word_right(selecting),
+        (KeyCode::Up, true) => composer.move_to_start(selecting),
+        (KeyCode::Down, true) => composer.move_to_end(selecting),
+        _ => return false,
+    }
+    true
 }
 
 fn scroll_expanded_approval(
@@ -4030,6 +4050,35 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn composer_arrows_apply_control_and_shift_movements() {
+        let mut composer = Composer::default();
+        composer.insert_str("one two\nthree");
+
+        assert!(handle_composer_arrow(
+            &mut composer,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            80,
+        ));
+        assert_eq!(composer.cursor, "one two\n".len());
+
+        assert!(handle_composer_arrow(
+            &mut composer,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT,),
+            80,
+        ));
+        assert_eq!(composer.cursor, 0);
+        assert_eq!(composer.selection_range(), Some(0.."one two\n".len()));
+
+        assert!(handle_composer_arrow(
+            &mut composer,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            80,
+        ));
+        assert_eq!(composer.cursor, composer.text.len());
+        assert_eq!(composer.selection_range(), None);
     }
 
     #[test]

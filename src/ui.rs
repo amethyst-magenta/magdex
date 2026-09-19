@@ -26,6 +26,7 @@ const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
 const USER_BACKGROUND: Color = Color::Rgb(48, 48, 48);
 const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 38, 38);
+const COMPOSER_SELECTION_BACKGROUND: Color = Color::Rgb(54, 74, 78);
 const DIFF_ADD_BACKGROUND: Color = Color::Rgb(28, 65, 46);
 const DIFF_REMOVE_BACKGROUND: Color = Color::Rgb(78, 37, 34);
 const COPY_ANSWER_BACKGROUND: Color = Color::Rgb(25, 43, 45);
@@ -2550,20 +2551,7 @@ fn draw_composer(
             ),
         ]))
     } else {
-        let lines = layout
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                Line::from(vec![
-                    Span::styled(
-                        if index == 0 { "› " } else { "  " },
-                        Style::default().fg(ACCENT).bold(),
-                    ),
-                    Span::raw(line.clone()),
-                ])
-            })
-            .collect::<Vec<_>>();
+        let lines = composer_content_lines(layout, state.composer.selection_range());
         Text::from(lines)
     };
     frame.render_widget(
@@ -2590,6 +2578,38 @@ fn composer_block(shortcut_hint: &str, hint_style: Style) -> Block<'static> {
         .border_style(Style::default().fg(DIM))
         .padding(Padding::new(2, 2, 1, 1))
         .style(Style::default().bg(COMPOSER_BACKGROUND))
+}
+
+fn composer_content_lines(
+    layout: &ComposerLayout,
+    selection: Option<Range<usize>>,
+) -> Vec<Line<'static>> {
+    layout
+        .lines
+        .iter()
+        .zip(&layout.line_source_indices)
+        .enumerate()
+        .map(|(line_index, (line, source_indices))| {
+            let mut spans = vec![Span::styled(
+                if line_index == 0 { "› " } else { "  " },
+                Style::default().fg(ACCENT).bold(),
+            )];
+            spans.extend(line.chars().zip(source_indices).map(|(ch, source_index)| {
+                let selected = selection
+                    .as_ref()
+                    .is_some_and(|range| range.contains(source_index));
+                Span::styled(
+                    ch.to_string(),
+                    if selected {
+                        Style::default().bg(COMPOSER_SELECTION_BACKGROUND)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn copy_mode_hint(copy_mode: &CopyMode, width: u16) -> String {
@@ -3123,6 +3143,7 @@ fn draw_approval_feedback_panel(frame: &mut Frame, approval: &crate::model::Appr
         frame,
         &approval.feedback.text,
         approval.feedback.cursor,
+        approval.feedback.selection_range(),
         "Describe a better approach…",
         &editor_shortcut_hint("Enter send", "back", editor_hint_width(area.width, title)),
         Some(title),
@@ -3137,6 +3158,7 @@ fn draw_prompt_editor(
     frame: &mut Frame,
     text: &str,
     cursor: usize,
+    selection: Option<Range<usize>>,
     placeholder: &str,
     shortcut_hint: &str,
     title: Option<&str>,
@@ -3171,14 +3193,20 @@ fn draw_prompt_editor(
         return;
     }
 
-    let (display, display_cursor) = if secret {
+    let (display, display_cursor, display_selection) = if secret {
         let before_cursor = text[..cursor].chars().count();
+        let display_selection = selection.map(|range| {
+            let start = text[..range.start].chars().count() * '•'.len_utf8();
+            let end = text[..range.end].chars().count() * '•'.len_utf8();
+            start..end
+        });
         (
             "•".repeat(text.chars().count()),
             before_cursor * '•'.len_utf8(),
+            display_selection,
         )
     } else {
-        (text.to_string(), cursor)
+        (text.to_string(), cursor, selection)
     };
     let input_width = input_area.width.saturating_sub(2).max(1) as usize;
     let layout = layout_composer(&display, display_cursor, input_width);
@@ -3194,22 +3222,7 @@ fn draw_prompt_editor(
             Span::styled(placeholder.to_string(), Style::default().fg(DIM)),
         ]))
     } else {
-        Text::from(
-            layout
-                .lines
-                .iter()
-                .enumerate()
-                .map(|(index, line)| {
-                    Line::from(vec![
-                        Span::styled(
-                            if index == 0 { "› " } else { "  " },
-                            Style::default().fg(ACCENT).bold(),
-                        ),
-                        Span::raw(line.clone()),
-                    ])
-                })
-                .collect::<Vec<_>>(),
-        )
+        Text::from(composer_content_lines(&layout, display_selection))
     };
     frame.render_widget(
         Paragraph::new(content).scroll((vertical_scroll as u16, 0)),
@@ -3313,6 +3326,7 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
             frame,
             &request.input.text,
             request.input.cursor,
+            request.input.selection_range(),
             "Type an answer…",
             &editor_shortcut_hint(
                 "Enter answer",
@@ -4360,6 +4374,27 @@ mod tests {
         assert_eq!(buffer[(4, 2)].symbol(), "h");
         let top = (0..40).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
         assert!(top.contains("Ctrl+Y copy"));
+    }
+
+    #[test]
+    fn composer_renders_the_selected_text() {
+        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.composer.replace("hello world".into());
+        state.composer.move_word_left(true);
+        let layout = layout_composer(&state.composer.text, state.composer.cursor, 34);
+
+        terminal
+            .draw(|frame| draw_composer(frame, &state, &layout, &[], frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(9, 2)].symbol(), " ");
+        assert_eq!(buffer[(9, 2)].bg, COMPOSER_BACKGROUND);
+        for x in 10..15 {
+            assert_eq!(buffer[(x, 2)].bg, COMPOSER_SELECTION_BACKGROUND);
+        }
     }
 
     #[test]

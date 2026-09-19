@@ -40,6 +40,9 @@ magdex resume
 | `Ctrl+C` | Clear input; interrupt when empty; quit when idle and empty |
 | `Ctrl+P` / `Ctrl+N` | Recall older/newer messages in the composer |
 | `↑` / `↓` | Move between composer lines |
+| `Ctrl+←` / `Ctrl+→` | Move between words |
+| `Ctrl+↑` / `Ctrl+↓` | Move to the start/end of the composer |
+| `Shift` + arrow keys | Extend the text selection (also works with `Ctrl`) |
 | `Ctrl+K` / `Ctrl+J` | Smoothly scroll transcript up/down |
 | `Ctrl+G` | Jump to the latest output |
 | Mouse wheel | Scroll transcript |
