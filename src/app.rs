@@ -14,9 +14,9 @@ use crate::{
     model::{
         ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
         CommandAction, CommandActionKind, ContextUsage, CopyMode, FileChange, FileChangeKind,
-        ImageAttachment, ModelInfo, Popup, QuotaUsage, QuotaWindow, ResumePicker, ResumeScope,
-        ServerPrompt, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt, UserInputOption,
-        UserInputQuestion, UserInputRequest,
+        ImageAttachment, ModelInfo, Popup, QueuedTurn, QuotaUsage, QuotaWindow, ResumePicker,
+        ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt,
+        UserInputOption, UserInputQuestion, UserInputRequest,
     },
     notification::Notifier,
     rpc::{Incoming, RpcClient},
@@ -59,6 +59,7 @@ enum Pending {
         thread_id: String,
     },
     StartTurn,
+    SteerTurn,
     UpdateMode,
     Interrupt,
 }
@@ -66,6 +67,7 @@ enum Pending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlCAction {
     ClearedComposer,
+    RemovedQueuedTurn,
     Interrupt,
     Quit,
 }
@@ -327,6 +329,7 @@ impl Controller {
                 }
                 Ok(())
             }
+            Pending::SteerTurn => Ok(()),
             Pending::UpdateMode => Ok(()),
             Pending::Interrupt => Ok(()),
         }
@@ -736,6 +739,7 @@ impl Controller {
         let Some(thread) = self.state.threads.get(index) else {
             return Ok(());
         };
+        self.state.queued_turns.clear();
         let id = self.rpc.request(
             "thread/resume",
             thread_resume_params(&thread.id, &self.state.cwd),
@@ -857,7 +861,23 @@ impl Controller {
             return Ok(());
         };
         let images = self.state.image_attachments.clone();
-        let input = turn_input(&text, &images);
+        let queued = QueuedTurn { text, images };
+        if turn_in_progress(&self.state) {
+            self.state.remember_message(queued.text.clone());
+            self.state.composer.clear();
+            self.state.image_attachments.clear();
+            self.state.queued_turns.push_back(queued);
+            return Ok(());
+        }
+        self.start_queued_turn(&thread_id, &queued)?;
+        self.state.remember_message(queued.text.clone());
+        self.state.composer.clear();
+        self.state.image_attachments.clear();
+        Ok(())
+    }
+
+    fn start_queued_turn(&mut self, thread_id: &str, queued: &QueuedTurn) -> Result<()> {
+        let input = turn_input(&queued.text, &queued.images);
         let mut params = json!({
             "threadId": thread_id,
             "input": input
@@ -878,21 +898,35 @@ impl Controller {
             }
         }
         let id = self.rpc.request("turn/start", params)?;
-        self.state.remember_message(text.clone());
-        self.state.composer.clear();
-        self.state.image_attachments.clear();
         self.state.push(TranscriptBlock::new(
             BlockKind::User,
             "You",
-            user_input_display(&text, &images),
+            user_input_display(&queued.text, &queued.images),
         ));
         self.pending.insert(id, Pending::StartTurn);
         self.state.turn_started_at = Some(std::time::Instant::now());
         Ok(())
     }
 
+    fn start_next_queued_turn(&mut self) -> Result<()> {
+        let Some((thread_id, queued)) = take_next_queued_turn(&mut self.state) else {
+            return Ok(());
+        };
+        if let Err(error) = self.start_queued_turn(&thread_id, &queued) {
+            self.state.queued_turns.push_front(queued);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn handle_paste(&mut self, pasted: &str) {
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(Popup::Approval(approval)) = self.state.popup.as_mut() {
+            if approval.entering_feedback {
+                approval.feedback.insert_str(&pasted);
+            }
+            return;
+        }
         if let Some(Popup::UserInput(request)) = self.state.popup.as_mut() {
             if request.is_editing() {
                 request.input.insert_str(&pasted);
@@ -988,10 +1022,11 @@ impl Controller {
     }
 
     fn new_conversation(&mut self) -> Result<()> {
-        if self.state.turn_id.is_some() {
+        if turn_in_progress(&self.state) {
             return Ok(());
         }
         self.state.popup = None;
+        self.state.queued_turns.clear();
         self.state.clear_message_history();
         self.start_thread()
     }
@@ -1102,6 +1137,7 @@ impl Controller {
         self.state.thread_id = None;
         self.state.turn_id = None;
         self.state.turn_started_at = None;
+        self.state.queued_turns.clear();
         self.state.pending_server_requests.clear();
         self.initialize()
     }
@@ -1128,9 +1164,11 @@ impl Controller {
         }
 
         if let Some(direction) = control_scroll_direction(key) {
-            match direction {
-                ScrollDirection::Up => self.scroll_up(3),
-                ScrollDirection::Down => self.scroll_down(3),
+            if !scroll_expanded_approval(&mut self.state, direction, 3) {
+                match direction {
+                    ScrollDirection::Up => self.scroll_up(3),
+                    ScrollDirection::Down => self.scroll_down(3),
+                }
             }
             return Ok(());
         }
@@ -1382,14 +1420,40 @@ impl Controller {
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) -> Result<()> {
-        let key = normalize_list_navigation(key);
         let Some(Popup::Approval(current)) = self.state.popup.as_mut() else {
             return Ok(());
         };
+        let key = normalize_approval_key(key, current.entering_feedback);
+        if current.entering_feedback {
+            match key.code {
+                KeyCode::Esc => {
+                    current.entering_feedback = false;
+                    current.feedback.clear();
+                }
+                KeyCode::Enter if is_newline_key(key) => current.feedback.newline(),
+                KeyCode::Enter => {
+                    if current.feedback.text.trim().is_empty() {
+                        return Ok(());
+                    }
+                    return self.finish_approval(ApprovalChoice::DenyWithFeedback);
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    current.feedback.insert(ch)
+                }
+                KeyCode::Backspace => current.feedback.backspace(),
+                KeyCode::Delete => current.feedback.delete(),
+                KeyCode::Left => current.feedback.left(),
+                KeyCode::Right => current.feedback.right(),
+                KeyCode::Up => current.feedback.up(self.state.composer_width),
+                KeyCode::Down => current.feedback.down(self.state.composer_width),
+                _ => {}
+            }
+            return Ok(());
+        }
         let option_count = if matches!(current.kind, ApprovalKind::Unsupported) {
             1
         } else {
-            4
+            5
         };
         match key.code {
             KeyCode::Char('k') => {
@@ -1398,6 +1462,12 @@ impl Controller {
             }
             KeyCode::Char('j') => {
                 current.selected = (current.selected + 1).min(option_count - 1);
+                return Ok(());
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                current.expanded = !current.expanded;
+                current.scroll = 0;
+                current.max_scroll = 0;
                 return Ok(());
             }
             _ => {}
@@ -1409,7 +1479,11 @@ impl Controller {
                 0 => Some(ApprovalChoice::Allow),
                 1 => Some(ApprovalChoice::Session),
                 2 => Some(ApprovalChoice::Deny),
-                3 => Some(ApprovalChoice::Cancel),
+                3 => {
+                    current.entering_feedback = true;
+                    return Ok(());
+                }
+                4 => Some(ApprovalChoice::Cancel),
                 _ => None,
             },
             KeyCode::Esc if unsupported => Some(ApprovalChoice::Deny),
@@ -1419,10 +1493,17 @@ impl Controller {
         let Some(decision) = decision else {
             return Ok(());
         };
+        self.finish_approval(decision)
+    }
+
+    fn finish_approval(&mut self, decision: ApprovalChoice) -> Result<()> {
         let Some(Popup::Approval(approval)) = self.state.popup.take() else {
             return Ok(());
         };
         let result = approval_result(&approval, decision);
+        let feedback = approval_feedback(&approval, decision);
+        let steer = matches!(decision, ApprovalChoice::DenyWithFeedback)
+            .then(|| approval.feedback.text.trim().to_string());
         if matches!(approval.kind, ApprovalKind::Unsupported) {
             self.rpc
                 .respond_error(approval.id, "unsupported client request")?;
@@ -1432,14 +1513,30 @@ impl Controller {
         self.state.push(TranscriptBlock::new(
             BlockKind::Status,
             "Approval",
-            match decision {
-                ApprovalChoice::Allow => "Allowed",
-                ApprovalChoice::Session => "Allowed for session",
-                ApprovalChoice::Deny => "Denied",
-                ApprovalChoice::Cancel => "Denied and turn cancelled",
-            },
+            feedback,
         ));
+        if let Some(steer) = steer {
+            self.steer_active_turn(steer)?;
+        }
         self.state.show_next_server_prompt();
+        Ok(())
+    }
+
+    fn steer_active_turn(&mut self, text: String) -> Result<()> {
+        let (Some(thread_id), Some(turn_id)) =
+            (self.state.thread_id.clone(), self.state.turn_id.clone())
+        else {
+            self.state.push(TranscriptBlock::new(
+                BlockKind::Error,
+                "Error",
+                "Could not send approval feedback because the active turn ended",
+            ));
+            return Ok(());
+        };
+        let id = self
+            .rpc
+            .request("turn/steer", turn_steer_params(&thread_id, &turn_id, &text))?;
+        self.pending.insert(id, Pending::SteerTurn);
         Ok(())
     }
 
@@ -1635,11 +1732,26 @@ impl Controller {
         };
         let approval = Approval {
             id,
+            reason: matches!(kind, ApprovalKind::Command | ApprovalKind::Legacy)
+                .then(|| {
+                    params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                        .map(str::to_owned)
+                })
+                .flatten(),
             kind,
             title,
             detail,
             params,
             selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
         };
         self.notify_action_required(&approval.title);
         // Server prompts take precedence over navigation popups: the server is
@@ -1662,6 +1774,7 @@ impl Controller {
                 }
             }
             "turn/completed" => {
+                let has_queued_turn = !self.state.queued_turns.is_empty();
                 let error = params
                     .pointer("/turn/error/message")
                     .and_then(Value::as_str);
@@ -1670,12 +1783,14 @@ impl Controller {
                         .push(TranscriptBlock::new(BlockKind::Error, "Error", error));
                 }
                 match params.pointer("/turn/status").and_then(Value::as_str) {
-                    Some("completed") => self.notify_response_ready(),
+                    Some("completed") if !has_queued_turn => self.notify_response_ready(),
+                    Some("completed") => {}
                     Some("failed") => self.notify_turn_failed(),
                     Some("interrupted") | Some("inProgress") => {}
                     Some(_) => {}
                     None if error.is_some() => self.notify_turn_failed(),
-                    None => self.notify_response_ready(),
+                    None if !has_queued_turn => self.notify_response_ready(),
+                    None => {}
                 }
                 let duration_ms = params
                     .pointer("/turn/durationMs")
@@ -1691,6 +1806,7 @@ impl Controller {
                     self.state.push(turn_end_block(duration_ms));
                 }
                 self.flush_deferred_turn_events();
+                self.start_next_queued_turn()?;
             }
             "item/started" | "item/completed" => {
                 if let Some(item) = params.get("item") {
@@ -1850,6 +1966,16 @@ impl Controller {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        let approval_direction = match event.kind {
+            MouseEventKind::ScrollUp => Some(ScrollDirection::Up),
+            MouseEventKind::ScrollDown => Some(ScrollDirection::Down),
+            _ => None,
+        };
+        if approval_direction
+            .is_some_and(|direction| scroll_expanded_approval(&mut self.state, direction, 3))
+        {
+            return;
+        }
         if self.state.popup.is_some() {
             return;
         }
@@ -1888,6 +2014,19 @@ fn defer_turn_event_if_active(
     } else {
         Some(event)
     }
+}
+
+fn turn_in_progress(state: &AppState) -> bool {
+    state.turn_id.is_some() || state.turn_started_at.is_some()
+}
+
+fn take_next_queued_turn(state: &mut AppState) -> Option<(String, QueuedTurn)> {
+    if turn_in_progress(state) {
+        return None;
+    }
+    let thread_id = state.thread_id.clone()?;
+    let queued = state.queued_turns.pop_front()?;
+    Some((thread_id, queued))
 }
 
 fn toggle_latest_command(state: &mut AppState) {
@@ -2104,7 +2243,9 @@ fn prepare_control_c(state: &mut AppState) -> ControlCAction {
         state.composer.clear();
         state.image_attachments.clear();
         ControlCAction::ClearedComposer
-    } else if state.turn_id.is_some() {
+    } else if state.queued_turns.pop_back().is_some() {
+        ControlCAction::RemovedQueuedTurn
+    } else if turn_in_progress(state) {
         ControlCAction::Interrupt
     } else {
         state.quit = true;
@@ -2121,6 +2262,27 @@ fn control_scroll_direction(key: KeyEvent) -> Option<ScrollDirection> {
         KeyCode::Char('j') => Some(ScrollDirection::Down),
         _ => None,
     }
+}
+
+fn scroll_expanded_approval(
+    state: &mut AppState,
+    direction: ScrollDirection,
+    amount: usize,
+) -> bool {
+    let Some(Popup::Approval(approval)) = state.popup.as_mut() else {
+        return false;
+    };
+    if !approval.expanded || approval.entering_feedback {
+        return false;
+    }
+    approval.scroll = match direction {
+        ScrollDirection::Up => approval.scroll.saturating_sub(amount),
+        ScrollDirection::Down => approval
+            .scroll
+            .saturating_add(amount)
+            .min(approval.max_scroll),
+    };
+    true
 }
 
 pub(crate) fn normalize_control_shortcut(mut key: KeyEvent) -> KeyEvent {
@@ -2140,6 +2302,14 @@ fn normalize_list_navigation(mut key: KeyEvent) -> KeyEvent {
         code => code,
     };
     key
+}
+
+fn normalize_approval_key(key: KeyEvent, editing_feedback: bool) -> KeyEvent {
+    if editing_feedback {
+        key
+    } else {
+        normalize_list_navigation(key)
+    }
 }
 
 fn normalize_copy_navigation(mut key: KeyEvent) -> KeyEvent {
@@ -2182,6 +2352,7 @@ enum ApprovalChoice {
     Allow,
     Session,
     Deny,
+    DenyWithFeedback,
     Cancel,
 }
 
@@ -2190,8 +2361,21 @@ fn approval_result(approval: &Approval, choice: ApprovalChoice) -> Value {
         ApprovalKind::Command | ApprovalKind::File => json!({
             "decision": match choice {
                 ApprovalChoice::Allow => "accept",
-                ApprovalChoice::Session => "acceptForSession",
-                ApprovalChoice::Deny => "decline",
+                ApprovalChoice::Session => {
+                    if matches!(approval.kind, ApprovalKind::Command) {
+                        if let Some(amendment) = approval_execpolicy_amendment(approval) {
+                            return json!({
+                                "decision": {
+                                    "acceptWithExecpolicyAmendment": {
+                                        "execpolicy_amendment": amendment
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    "acceptForSession"
+                }
+                ApprovalChoice::Deny | ApprovalChoice::DenyWithFeedback => "decline",
                 ApprovalChoice::Cancel => "cancel",
             }
         }),
@@ -2200,7 +2384,7 @@ fn approval_result(approval: &Approval, choice: ApprovalChoice) -> Value {
                 "permissions": approval.params.get("permissions").cloned().unwrap_or(json!({})),
                 "scope": if matches!(choice, ApprovalChoice::Session) { "session" } else { "turn" }
             }),
-            ApprovalChoice::Deny | ApprovalChoice::Cancel => {
+            ApprovalChoice::Deny | ApprovalChoice::DenyWithFeedback | ApprovalChoice::Cancel => {
                 json!({"permissions": {}, "scope": "turn"})
             }
         },
@@ -2209,11 +2393,93 @@ fn approval_result(approval: &Approval, choice: ApprovalChoice) -> Value {
                 ApprovalChoice::Allow => Value::String("approved".into()),
                 ApprovalChoice::Session => Value::String("approved_for_session".into()),
                 ApprovalChoice::Deny => json!({"denied": {"rejection": "Denied by user"}}),
+                ApprovalChoice::DenyWithFeedback => json!({
+                    "denied": {"rejection": approval.feedback.text.trim()}
+                }),
                 ApprovalChoice::Cancel => Value::String("abort".into()),
             }
         }),
         ApprovalKind::Unsupported => Value::Null,
     }
+}
+
+fn approval_execpolicy_amendment(approval: &Approval) -> Option<Vec<String>> {
+    let amendment = approval
+        .params
+        .get("proposedExecpolicyAmendment")?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!amendment.is_empty()).then_some(amendment)
+}
+
+fn approval_feedback(approval: &Approval, choice: ApprovalChoice) -> String {
+    let command = approval_command_summary(&approval.detail);
+    match (&approval.kind, choice) {
+        (ApprovalKind::Command, ApprovalChoice::Allow)
+        | (ApprovalKind::Legacy, ApprovalChoice::Allow)
+            if approval.title == "Run command?" =>
+        {
+            format!("You approved Magdex to run {command} this time")
+        }
+        (ApprovalKind::Command, ApprovalChoice::Session)
+        | (ApprovalKind::Legacy, ApprovalChoice::Session)
+            if approval.title == "Run command?" =>
+        {
+            if let Some(amendment) = approval_execpolicy_amendment(approval) {
+                format!(
+                    "You approved Magdex to run {command} and remember commands starting with {}",
+                    amendment.join(" ")
+                )
+            } else {
+                format!("You approved Magdex to run {command} for this session")
+            }
+        }
+        (ApprovalKind::Command, ApprovalChoice::Deny)
+        | (ApprovalKind::Legacy, ApprovalChoice::Deny)
+            if approval.title == "Run command?" =>
+        {
+            format!("You denied Magdex permission to run {command}")
+        }
+        (ApprovalKind::Command, ApprovalChoice::DenyWithFeedback)
+        | (ApprovalKind::Legacy, ApprovalChoice::DenyWithFeedback)
+            if approval.title == "Run command?" =>
+        {
+            let direction = approval_command_summary(approval.feedback.text.trim());
+            format!("You denied Magdex permission to run {command} and asked it to {direction}")
+        }
+        (ApprovalKind::Command, ApprovalChoice::Cancel)
+        | (ApprovalKind::Legacy, ApprovalChoice::Cancel)
+            if approval.title == "Run command?" =>
+        {
+            format!("You denied Magdex permission to run {command} and cancelled the turn")
+        }
+        (_, ApprovalChoice::Allow) => "You approved Magdex this time".to_string(),
+        (_, ApprovalChoice::Session) => "You approved Magdex for this session".to_string(),
+        (_, ApprovalChoice::Deny) => "You denied Magdex permission".to_string(),
+        (_, ApprovalChoice::DenyWithFeedback) => {
+            let direction = approval_command_summary(approval.feedback.text.trim());
+            format!("You denied Magdex permission and asked it to {direction}")
+        }
+        (_, ApprovalChoice::Cancel) => {
+            "You denied Magdex permission and cancelled the turn".to_string()
+        }
+    }
+}
+
+fn approval_command_summary(command: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if command.chars().count() <= MAX_CHARS {
+        return command;
+    }
+    let mut summary = command.chars().take(MAX_CHARS - 1).collect::<String>();
+    summary.push('…');
+    summary
 }
 
 fn collaboration_modes_from_response(result: &Value) -> Vec<CollaborationModeInfo> {
@@ -2622,6 +2888,14 @@ fn turn_input(text: &str, images: &[ImageAttachment]) -> Vec<Value> {
             .map(|image| json!({"type": "image", "url": image.data_url})),
     );
     input
+}
+
+fn turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": turn_input(text, &[]),
+    })
 }
 
 fn user_input_display(text: &str, images: &[ImageAttachment]) -> String {
@@ -3411,8 +3685,14 @@ mod tests {
             kind: ApprovalKind::Command,
             title: String::new(),
             detail: String::new(),
+            reason: None,
             params: json!({}),
             selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
         };
         assert_eq!(
             approval_result(&approval, ApprovalChoice::Session),
@@ -3425,6 +3705,62 @@ mod tests {
     }
 
     #[test]
+    fn command_approval_uses_the_proposed_rule_and_describes_the_result() {
+        let mut approval = Approval {
+            id: json!(7),
+            kind: ApprovalKind::Command,
+            title: "Run command?".into(),
+            detail: "cargo test --locked".into(),
+            reason: Some("Verify the approval flow".into()),
+            params: json!({"proposedExecpolicyAmendment": ["cargo", "test"]}),
+            selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
+        };
+
+        assert_eq!(
+            approval_result(&approval, ApprovalChoice::Session),
+            json!({
+                "decision": {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": ["cargo", "test"]
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            approval_feedback(&approval, ApprovalChoice::Allow),
+            "You approved Magdex to run cargo test --locked this time"
+        );
+        assert_eq!(
+            approval_feedback(&approval, ApprovalChoice::Session),
+            "You approved Magdex to run cargo test --locked and remember commands starting with cargo test"
+        );
+        approval
+            .feedback
+            .insert_str("run the focused approval test instead");
+        assert_eq!(
+            approval_result(&approval, ApprovalChoice::DenyWithFeedback),
+            json!({"decision": "decline"})
+        );
+        assert_eq!(
+            approval_feedback(&approval, ApprovalChoice::DenyWithFeedback),
+            "You denied Magdex permission to run cargo test --locked and asked it to run the focused approval test instead"
+        );
+        assert_eq!(
+            turn_steer_params("thread-1", "turn-1", &approval.feedback.text),
+            json!({
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-1",
+                "input": [{"type": "text", "text": "run the focused approval test instead"}]
+            })
+        );
+    }
+
+    #[test]
     fn permission_approval_echoes_only_server_request() {
         let permissions = json!({"network": {"enabled": true}});
         let approval = Approval {
@@ -3432,8 +3768,14 @@ mod tests {
             kind: ApprovalKind::Permissions,
             title: String::new(),
             detail: String::new(),
+            reason: None,
             params: json!({"permissions": permissions}),
             selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
         };
         assert_eq!(
             approval_result(&approval, ApprovalChoice::Allow),
@@ -4089,11 +4431,42 @@ mod tests {
             ControlCAction::ClearedComposer
         );
         assert!(state.composer.text.is_empty());
+        state.queued_turns.push_back(QueuedTurn {
+            text: "next request".into(),
+            images: vec![],
+        });
+        assert_eq!(
+            prepare_control_c(&mut state),
+            ControlCAction::RemovedQueuedTurn
+        );
+        assert!(state.queued_turns.is_empty());
         assert_eq!(prepare_control_c(&mut state), ControlCAction::Interrupt);
 
         state.turn_id = None;
         assert_eq!(prepare_control_c(&mut state), ControlCAction::Quit);
         assert!(state.quit);
+    }
+
+    #[test]
+    fn queued_turn_waits_for_the_active_turn_and_keeps_fifo_order() {
+        let mut state = AppState::new("/project".into(), true);
+        state.thread_id = Some("thread-1".into());
+        state.turn_id = Some("turn-1".into());
+        for text in ["second", "third"] {
+            state.queued_turns.push_back(QueuedTurn {
+                text: text.into(),
+                images: vec![],
+            });
+        }
+
+        assert!(take_next_queued_turn(&mut state).is_none());
+        assert_eq!(state.queued_turns.len(), 2);
+
+        state.turn_id = None;
+        let (thread_id, queued) = take_next_queued_turn(&mut state).unwrap();
+        assert_eq!(thread_id, "thread-1");
+        assert_eq!(queued.text, "second");
+        assert_eq!(state.queued_turns.front().unwrap().text, "third");
     }
 
     #[test]
@@ -4121,6 +4494,61 @@ mod tests {
         assert_eq!(normalize_list_navigation(down).code, KeyCode::Char('j'));
         assert_eq!(normalize_list_navigation(up).code, KeyCode::Char('k'));
         assert_eq!(normalize_list_navigation(text).code, KeyCode::Char('я'));
+    }
+
+    #[test]
+    fn approval_feedback_keeps_russian_o_and_l_as_text() {
+        for character in ['о', 'л'] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert_eq!(
+                normalize_approval_key(key, true).code,
+                KeyCode::Char(character)
+            );
+        }
+        let navigation = KeyEvent::new(KeyCode::Char('о'), KeyModifiers::NONE);
+        assert_eq!(
+            normalize_approval_key(navigation, false).code,
+            KeyCode::Char('j')
+        );
+    }
+
+    #[test]
+    fn expanded_approval_scroll_stays_within_its_body() {
+        let mut state = AppState::new("/project".into(), true);
+        state.popup = Some(Popup::Approval(Approval {
+            id: json!(1),
+            kind: ApprovalKind::Command,
+            title: "Run command?".into(),
+            detail: "long command".into(),
+            reason: None,
+            params: json!({}),
+            selected: 0,
+            expanded: true,
+            scroll: 0,
+            max_scroll: 7,
+            feedback: Default::default(),
+            entering_feedback: false,
+        }));
+
+        assert!(scroll_expanded_approval(
+            &mut state,
+            ScrollDirection::Down,
+            3
+        ));
+        let Some(Popup::Approval(approval)) = state.popup.as_ref() else {
+            panic!("approval popup missing");
+        };
+        assert_eq!(approval.scroll, 3);
+        scroll_expanded_approval(&mut state, ScrollDirection::Down, 99);
+        let Some(Popup::Approval(approval)) = state.popup.as_ref() else {
+            panic!("approval popup missing");
+        };
+        assert_eq!(approval.scroll, 7);
+        scroll_expanded_approval(&mut state, ScrollDirection::Up, 3);
+        let Some(Popup::Approval(approval)) = state.popup.as_ref() else {
+            panic!("approval popup missing");
+        };
+        assert_eq!(approval.scroll, 4);
     }
 
     #[test]

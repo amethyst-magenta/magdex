@@ -226,8 +226,14 @@ pub struct Approval {
     pub kind: ApprovalKind,
     pub title: String,
     pub detail: String,
+    pub reason: Option<String>,
     pub params: Value,
     pub selected: usize,
+    pub expanded: bool,
+    pub scroll: usize,
+    pub max_scroll: usize,
+    pub feedback: Composer,
+    pub entering_feedback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +296,12 @@ pub struct ImageAttachment {
     pub data_url: String,
     pub width: usize,
     pub height: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueuedTurn {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
 }
 
 impl Composer {
@@ -532,6 +544,7 @@ pub struct AppState {
     pub message_history_draft: String,
     pub composer_width: usize,
     pub image_attachments: Vec<ImageAttachment>,
+    pub queued_turns: VecDeque<QueuedTurn>,
     pub popup: Option<Popup>,
     pub pending_server_requests: VecDeque<ServerPrompt>,
     pub scroll: usize,
@@ -615,6 +628,7 @@ impl AppState {
             message_history_draft: String::new(),
             composer_width: 74,
             image_attachments: vec![],
+            queued_turns: VecDeque::new(),
             popup: None,
             pending_server_requests: VecDeque::new(),
             scroll: 0,

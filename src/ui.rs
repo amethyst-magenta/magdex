@@ -16,7 +16,7 @@ use crate::{
     model::{
         display_path, layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind,
         CommandAction, CommandActionKind, ComposerLayout, ContextUsage, CopyMode, FileChange,
-        FileChangeKind, ImageAttachment, Popup, QuotaUsage, ResumeScope, ThreadSummary,
+        FileChangeKind, ImageAttachment, Popup, QueuedTurn, QuotaUsage, ResumeScope, ThreadSummary,
         TranscriptBlock, TranscriptHyperlink, TrustDirectoryPrompt, UserInputRequest,
         VisibleHyperlink,
     },
@@ -55,9 +55,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     );
     let composer_lines = composer.lines.len().clamp(1, 8) as u16;
     let attachment_rows = attachment_row_count(state.image_attachments.len());
+    let queued_rows = queued_turn_row_count(state.queued_turns.len());
     let slash_suggestions = slash_command_suggestions(&state.composer.text);
     let suggestion_rows = slash_suggestions.len() as u16;
-    let composer_height = (composer_lines + attachment_rows + suggestion_rows + 4)
+    let composer_height = (composer_lines + attachment_rows + queued_rows + suggestion_rows + 4)
         .min(area.height.saturating_sub(4).max(5));
     let panel_gap = u16::from(state.popup.is_some() && area.height > 4);
     let bottom_height = state
@@ -78,6 +79,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
     draw_header(frame, state, chunks[0]);
     draw_transcript(frame, state, chunks[1]);
+    if let Some(Popup::Approval(approval)) = state.popup.as_mut() {
+        update_approval_scroll_bounds(approval, chunks[3]);
+    }
     if let Some(popup) = &state.popup {
         draw_bottom_panel(frame, state, popup.clone(), chunks[3]);
     } else {
@@ -93,8 +97,9 @@ pub(crate) fn expected_transcript_viewport_height(state: &AppState, area: Rect) 
     let composer = layout_composer(&state.composer.text, state.composer.cursor, composer_width);
     let composer_lines = composer.lines.len().clamp(1, 8) as u16;
     let attachment_rows = attachment_row_count(state.image_attachments.len());
+    let queued_rows = queued_turn_row_count(state.queued_turns.len());
     let suggestion_rows = slash_command_suggestions(&state.composer.text).len() as u16;
-    let composer_height = (composer_lines + attachment_rows + suggestion_rows + 4)
+    let composer_height = (composer_lines + attachment_rows + queued_rows + suggestion_rows + 4)
         .min(area.height.saturating_sub(4).max(5));
     let panel_gap = u16::from(state.popup.is_some() && area.height > 4);
     let bottom_height = state
@@ -703,14 +708,32 @@ fn append_block_with_copy_mode(
             }
         }
         BlockKind::Status => {
-            push_wrapped_line(
-                lines,
-                vec![
-                    Span::styled("  · ", Style::default().fg(DIM)),
-                    Span::styled(block.text.clone(), Style::default().fg(DIM)),
-                ],
-                width,
-            );
+            if block.title == "Approval" {
+                let (verb, color) = if block.text.starts_with("You approved ") {
+                    ("approved", Color::Green)
+                } else {
+                    ("denied", Color::Red)
+                };
+                let (before, after) = block.text.split_once(verb).unwrap_or(("", &block.text));
+                push_wrapped_line(
+                    lines,
+                    vec![
+                        Span::styled(format!("  {before}"), Style::default().fg(DIM)),
+                        Span::styled(verb.to_string(), Style::default().fg(color).bold()),
+                        Span::styled(after.to_string(), Style::default().fg(DIM)),
+                    ],
+                    width,
+                );
+            } else {
+                push_wrapped_line(
+                    lines,
+                    vec![
+                        Span::styled("  · ", Style::default().fg(DIM)),
+                        Span::styled(block.text.clone(), Style::default().fg(DIM)),
+                    ],
+                    width,
+                );
+            }
         }
         BlockKind::TurnEnd => {
             let label = format!("─ Worked for {} ", block.text);
@@ -2419,10 +2442,15 @@ fn draw_composer(
         feedback.clone()
     } else if let Some(copy_mode) = &state.copy_mode {
         copy_mode_hint(copy_mode, area.width)
+    } else if !state.queued_turns.is_empty() {
+        format!("{} queued · Ctrl+C remove latest", state.queued_turns.len())
     } else {
         composer_shortcut_hint(area.width).into()
     };
-    let hint_style = if state.copy_feedback.is_some() || state.copy_mode.is_some() {
+    let hint_style = if state.copy_feedback.is_some()
+        || state.copy_mode.is_some()
+        || !state.queued_turns.is_empty()
+    {
         Style::default().fg(ACCENT)
     } else {
         Style::default().fg(DIM)
@@ -2441,8 +2469,17 @@ fn draw_composer(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let queued = queued_turn_lines(&state.queued_turns, inner.width as usize);
+    let queued_height = (queued.len() as u16).min(inner.height);
+    if queued_height > 0 {
+        frame.render_widget(
+            Paragraph::new(queued),
+            Rect::new(inner.x, inner.y, inner.width, queued_height),
+        );
+    }
     let attachments = attachment_labels(&state.image_attachments);
-    let attachment_height = (attachments.len() as u16).min(inner.height);
+    let attachment_height =
+        (attachments.len() as u16).min(inner.height.saturating_sub(queued_height));
     if attachment_height > 0 {
         let lines = attachments
             .into_iter()
@@ -2450,13 +2487,22 @@ fn draw_composer(
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines),
-            Rect::new(inner.x, inner.y, inner.width, attachment_height),
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(queued_height),
+                inner.width,
+                attachment_height,
+            ),
         );
     }
-    let suggestions_y = inner.y.saturating_add(attachment_height);
+    let suggestions_y = inner
+        .y
+        .saturating_add(queued_height)
+        .saturating_add(attachment_height);
     let suggestion_height = (suggestions.len() as u16).min(
         inner
             .height
+            .saturating_sub(queued_height)
             .saturating_sub(attachment_height)
             .saturating_sub(1),
     );
@@ -2476,7 +2522,9 @@ fn draw_composer(
             Rect::new(inner.x, suggestions_y, inner.width, suggestion_height),
         );
     }
-    let content_height = attachment_height.saturating_add(suggestion_height);
+    let content_height = queued_height
+        .saturating_add(attachment_height)
+        .saturating_add(suggestion_height);
     let input_area = Rect::new(
         inner.x,
         inner.y.saturating_add(content_height),
@@ -2494,7 +2542,14 @@ fn draw_composer(
     let content = if state.composer.text.is_empty() {
         Text::from(Line::from(vec![
             Span::styled("› ", Style::default().fg(ACCENT).bold()),
-            Span::styled("Ask Codex…", Style::default().fg(DIM)),
+            Span::styled(
+                if state.turn_id.is_some() || state.turn_started_at.is_some() {
+                    "Queue next request…"
+                } else {
+                    "Ask Codex…"
+                },
+                Style::default().fg(DIM),
+            ),
         ]))
     } else {
         let lines = layout
@@ -2571,6 +2626,56 @@ fn attachment_row_count(count: usize) -> u16 {
     count.min(3) as u16
 }
 
+fn queued_turn_row_count(count: usize) -> u16 {
+    count.min(3) as u16
+}
+
+fn queued_turn_lines(
+    queued: &std::collections::VecDeque<QueuedTurn>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let total = queued.len();
+    let visible = total.min(3);
+    let message_rows = if total > 3 { visible - 1 } else { visible };
+    let mut lines = queued
+        .iter()
+        .take(message_rows)
+        .enumerate()
+        .map(|(index, queued)| {
+            let label = if total == 1 {
+                "Next".to_string()
+            } else {
+                format!("Next {}", index + 1)
+            };
+            let preview = queued_turn_preview(queued);
+            let prefix = format!("{label} · ");
+            Line::from(vec![
+                Span::styled(prefix.clone(), Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    truncate(&preview, width.saturating_sub(prefix.width())),
+                    Style::default().fg(DIM),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if total > 3 {
+        lines.push(Line::from(Span::styled(
+            format!("… +{} more queued", total - message_rows),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
+}
+
+fn queued_turn_preview(queued: &QueuedTurn) -> String {
+    let text = queued.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match (text.is_empty(), queued.images.len()) {
+        (false, 0) => text,
+        (false, count) => format!("{text} · {count} image(s)"),
+        (true, count) => format!("{count} image(s)"),
+    }
+}
+
 fn attachment_labels(images: &[ImageAttachment]) -> Vec<String> {
     if images.len() <= 3 {
         return images
@@ -2629,13 +2734,23 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
             (visual_line_count(&detail, width) as u16 + option_count + 3).clamp(7, 20)
         }
         Popup::Approval(approval) => {
-            let option_count = approval_options(&approval.kind).len();
-            let detail_lines = approval
-                .detail
-                .lines()
-                .map(|line| visual_line_count(line, width.saturating_sub(6)))
-                .sum::<usize>();
-            (detail_lines as u16 + option_count as u16 + 4).clamp(8, 18)
+            if approval.entering_feedback {
+                let input_width = width.saturating_sub(6).max(1) as usize;
+                let lines = layout_composer(
+                    &approval.feedback.text,
+                    approval.feedback.cursor,
+                    input_width,
+                )
+                .lines
+                .len()
+                .clamp(1, 5) as u16;
+                return lines + 4;
+            }
+            let option_count = approval_options(approval).len();
+            let body_width = width.saturating_sub(4).max(1) as usize;
+            let body_lines = approval_body_lines(approval, body_width).len() as u16;
+            let maximum = if approval.expanded { 40 } else { 18 };
+            (body_lines + option_count as u16 + 4).clamp(8, maximum)
         }
         Popup::UserInput(request) => {
             let Some(question) = request.current_question() else {
@@ -2820,17 +2935,30 @@ fn trust_directory_detail(prompt: &TrustDirectoryPrompt) -> String {
     detail
 }
 
-fn approval_options(kind: &ApprovalKind) -> &'static [&'static str] {
-    if matches!(kind, ApprovalKind::Unsupported) {
-        &["Decline"]
-    } else {
-        &[
-            "Allow once",
-            "Allow for this session",
-            "Deny",
-            "Deny and cancel turn",
-        ]
+fn approval_options(approval: &crate::model::Approval) -> Vec<String> {
+    if matches!(approval.kind, ApprovalKind::Unsupported) {
+        return vec!["Decline".to_string()];
     }
+    let persistent = approval
+        .params
+        .get("proposedExecpolicyAmendment")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| {
+            parts
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        })
+        .filter(|parts| !parts.is_empty())
+        .map(|parts| format!("Allow commands starting with `{}`", parts.join(" ")))
+        .unwrap_or_else(|| "Allow for this session".to_string());
+    vec![
+        "Allow once".to_string(),
+        persistent,
+        "Deny".to_string(),
+        "Deny and tell Magdex what to do differently".to_string(),
+        "Deny and cancel turn".to_string(),
+    ]
 }
 
 fn panel_block(title: &str, bottom_padding: u16) -> Block<'_> {
@@ -2878,8 +3006,17 @@ fn draw_text_panel(frame: &mut Frame, title: &str, text: String, area: Rect) {
 }
 
 fn draw_approval_panel(frame: &mut Frame, approval: &crate::model::Approval, area: Rect) {
-    let options = approval_options(&approval.kind);
-    let block = panel_block(&approval.title, 1);
+    if approval.entering_feedback {
+        draw_approval_feedback_panel(frame, approval, area);
+        return;
+    }
+    let options = approval_options(approval);
+    let title = if approval.expanded {
+        format!("{} · Ctrl+K/J scroll · Ctrl+O collapse", approval.title)
+    } else {
+        approval.title.clone()
+    };
+    let block = panel_block(&title, 1);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -2891,25 +3028,16 @@ fn draw_approval_panel(frame: &mut Frame, approval: &crate::model::Approval, are
         ])
         .split(inner);
 
-    let command = matches!(approval.kind, ApprovalKind::Command)
-        || matches!(approval.kind, ApprovalKind::Legacy) && approval.title == "Run command?";
-    if command {
-        let lines = approval
-            .detail
-            .lines()
-            .map(|line| {
-                Line::from(vec![
-                    Span::styled("$ ", Style::default().fg(Color::Yellow).bold()),
-                    Span::styled(line.to_string(), Style::default().fg(Color::Yellow)),
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
-    } else {
+    let body = approval_body_lines(approval, chunks[0].width.max(1) as usize);
+    if approval.expanded {
+        let max_scroll = body.len().saturating_sub(chunks[0].height as usize);
         frame.render_widget(
-            Paragraph::new(approval.detail.clone()).wrap(Wrap { trim: false }),
+            Paragraph::new(body).scroll((approval.scroll.min(max_scroll) as u16, 0)),
             chunks[0],
         );
+    } else {
+        let body = collapse_approval_body(body, chunks[0].height as usize, false);
+        frame.render_widget(Paragraph::new(body), chunks[0]);
     }
 
     frame.render_widget(
@@ -2918,13 +3046,147 @@ fn draw_approval_panel(frame: &mut Frame, approval: &crate::model::Approval, are
     );
     let entries = options
         .iter()
-        .map(|option| ListItem::new(*option))
+        .map(|option| ListItem::new(option.as_str()))
         .collect::<Vec<_>>();
     let list = List::new(entries)
         .highlight_symbol("› ")
         .highlight_style(Style::default().fg(ACCENT).bold());
     let mut list_state = ListState::default().with_selected(Some(approval.selected));
     frame.render_stateful_widget(list, chunks[2], &mut list_state);
+}
+
+fn update_approval_scroll_bounds(approval: &mut crate::model::Approval, area: Rect) {
+    if !approval.expanded || approval.entering_feedback {
+        approval.scroll = 0;
+        approval.max_scroll = 0;
+        return;
+    }
+    let option_count = approval_options(approval).len() as u16;
+    let block = panel_block(&approval.title, 1);
+    let inner = block.inner(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(option_count),
+        ])
+        .split(inner);
+    let body_lines = approval_body_lines(approval, chunks[0].width.max(1) as usize).len();
+    approval.max_scroll = body_lines.saturating_sub(chunks[0].height as usize);
+    approval.scroll = approval.scroll.min(approval.max_scroll);
+}
+
+fn draw_approval_feedback_panel(frame: &mut Frame, approval: &crate::model::Approval, area: Rect) {
+    let block = panel_block("Tell Magdex what to do differently", 1);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let input_width = chunks[0].width.saturating_sub(2).max(1) as usize;
+    let layout = layout_composer(
+        &approval.feedback.text,
+        approval.feedback.cursor,
+        input_width,
+    );
+    let visible_lines = chunks[0].height.max(1) as usize;
+    let vertical_scroll = layout
+        .cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_lines)
+        .min(layout.lines.len().saturating_sub(visible_lines));
+    let lines = layout
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 { "› " } else { "  " },
+                    Style::default().fg(ACCENT).bold(),
+                ),
+                if line.is_empty() && approval.feedback.text.is_empty() {
+                    Span::styled("Describe a better approach…", Style::default().fg(DIM))
+                } else {
+                    Span::raw(line.clone())
+                },
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).scroll((vertical_scroll as u16, 0)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter send · Shift+Enter newline · Esc back")
+            .style(Style::default().fg(DIM)),
+        chunks[1],
+    );
+    let cursor_x = chunks[0]
+        .x
+        .saturating_add(2)
+        .saturating_add(layout.cursor_col.min(input_width) as u16);
+    let cursor_y = chunks[0]
+        .y
+        .saturating_add(layout.cursor_row.saturating_sub(vertical_scroll) as u16);
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn approval_body_lines(approval: &crate::model::Approval, width: usize) -> Vec<Line<'static>> {
+    let command = matches!(approval.kind, ApprovalKind::Command)
+        || matches!(approval.kind, ApprovalKind::Legacy) && approval.title == "Run command?";
+    if !command {
+        let mut lines = Vec::new();
+        for detail in approval.detail.lines() {
+            push_wrapped_line(&mut lines, vec![Span::raw(detail.to_string())], width);
+        }
+        return lines;
+    }
+
+    let mut lines = Vec::new();
+    if let Some(reason) = approval.reason.as_deref() {
+        push_wrapped_line(
+            &mut lines,
+            vec![
+                Span::styled("Reason: ", Style::default().fg(DIM)),
+                Span::styled(reason.to_string(), Style::default().italic()),
+            ],
+            width,
+        );
+        lines.push(Line::default());
+    }
+    for command in approval.detail.lines() {
+        let mut spans = vec![Span::styled(
+            "$ ",
+            Style::default().fg(Color::Yellow).bold(),
+        )];
+        spans.extend(shell_command_spans(command));
+        push_wrapped_line(&mut lines, spans, width);
+    }
+    lines
+}
+
+fn collapse_approval_body(
+    lines: Vec<Line<'static>>,
+    available: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    if expanded || lines.len() <= available || available < 3 {
+        return lines;
+    }
+    let leading = available.saturating_sub(2);
+    let hidden = lines.len().saturating_sub(leading + 1);
+    let mut visible = lines.iter().take(leading).cloned().collect::<Vec<_>>();
+    visible.push(Line::from(Span::styled(
+        format!("… +{hidden} lines · Ctrl+O to expand"),
+        Style::default().fg(DIM),
+    )));
+    if let Some(last) = lines.last() {
+        visible.push(last.clone());
+    }
+    visible
 }
 
 fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Rect) {
@@ -4066,6 +4328,36 @@ mod tests {
     }
 
     #[test]
+    fn composer_shows_queued_turns_above_the_next_prompt() {
+        let backend = ratatui::backend::TestBackend::new(48, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.turn_id = Some("turn-1".into());
+        state.queued_turns.push_back(QueuedTurn {
+            text: "Review the tests after this finishes".into(),
+            images: vec![],
+        });
+        state.queued_turns.push_back(QueuedTurn {
+            text: "Then update the documentation".into(),
+            images: vec![],
+        });
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rows = (0..14)
+            .map(|y| {
+                (0..48)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains("Next 1 · Review")));
+        assert!(rows.iter().any(|row| row.contains("Next 2 · Then")));
+        assert!(rows.iter().any(|row| row.contains("Queue next request…")));
+        assert!(rows.iter().any(|row| row.contains("2 queued")));
+    }
+
+    #[test]
     fn transcript_uses_the_full_terminal_width() {
         let backend = ratatui::backend::TestBackend::new(180, 4);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -4385,8 +4677,14 @@ mod tests {
             kind: ApprovalKind::Command,
             title: "Run command?".into(),
             detail: "cargo test".into(),
+            reason: Some("Verify approval rendering".into()),
             params: serde_json::json!({}),
             selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
         };
 
         terminal
@@ -4401,6 +4699,9 @@ mod tests {
             .iter()
             .position(|row| row.contains("$ cargo test"))
             .unwrap();
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Reason: Verify approval rendering")));
         let divider_row = rows
             .iter()
             .enumerate()
@@ -4414,6 +4715,120 @@ mod tests {
         assert!(command_row < divider_row);
         assert_eq!(divider_row + 1, options_row);
         assert_eq!(buffer[(2, command_row as u16)].fg, Color::Yellow);
+    }
+
+    #[test]
+    fn approval_collapses_long_commands_and_names_the_proposed_rule() {
+        let approval = crate::model::Approval {
+            id: serde_json::json!(1),
+            kind: ApprovalKind::Command,
+            title: "Run command?".into(),
+            detail: format!("cargo test {} final-argument", "long-argument ".repeat(20)),
+            reason: Some("Verify approval rendering".into()),
+            params: serde_json::json!({"proposedExecpolicyAmendment": ["cargo", "test"]}),
+            selected: 0,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: false,
+        };
+
+        let body = approval_body_lines(&approval, 24);
+        let collapsed = collapse_approval_body(body.clone(), 6, false);
+        let rendered = collapsed
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(collapsed.len(), 6);
+        assert!(rendered.contains("Ctrl+O to expand"));
+        assert!(rendered.contains("final-argument"));
+        assert_eq!(collapse_approval_body(body.clone(), body.len(), true), body);
+        assert_eq!(
+            approval_options(&approval)[1],
+            "Allow commands starting with `cargo test`"
+        );
+    }
+
+    #[test]
+    fn approval_feedback_replaces_the_options_with_an_editor() {
+        let backend = ratatui::backend::TestBackend::new(64, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut approval = crate::model::Approval {
+            id: serde_json::json!(1),
+            kind: ApprovalKind::Command,
+            title: "Run command?".into(),
+            detail: "cargo test".into(),
+            reason: None,
+            params: serde_json::json!({}),
+            selected: 3,
+            expanded: false,
+            scroll: 0,
+            max_scroll: 0,
+            feedback: Default::default(),
+            entering_feedback: true,
+        };
+        approval.feedback.insert_str("Run only the focused test");
+
+        terminal
+            .draw(|frame| draw_approval_panel(frame, &approval, frame.area()))
+            .unwrap();
+
+        let rows = (0..8)
+            .map(|y| {
+                (0..64)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Tell Magdex what to do differently")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("› Run only the focused test")));
+        assert!(rows.iter().any(|row| row.contains("Enter send")));
+    }
+
+    #[test]
+    fn expanded_approval_scrolls_the_full_command_body() {
+        let backend = ratatui::backend::TestBackend::new(64, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let approval = crate::model::Approval {
+            id: serde_json::json!(1),
+            kind: ApprovalKind::Command,
+            title: "Run command?".into(),
+            detail: (0..18)
+                .map(|index| format!("command-segment-{index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            reason: None,
+            params: serde_json::json!({}),
+            selected: 0,
+            expanded: true,
+            scroll: 10,
+            max_scroll: 15,
+            feedback: Default::default(),
+            entering_feedback: false,
+        };
+
+        terminal
+            .draw(|frame| draw_approval_panel(frame, &approval, frame.area()))
+            .unwrap();
+
+        let rendered = (0..14)
+            .map(|y| {
+                (0..64)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Ctrl+K/J scroll"));
+        assert!(!rendered.contains("command-segment-00"));
+        assert!(rendered.contains("command-segment-10"));
+        assert!(rendered.contains("Allow once"));
     }
 
     #[test]
