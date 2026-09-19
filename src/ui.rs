@@ -206,7 +206,7 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new("Tab current/all · j/k or ↑/↓ move · Enter resume · Ctrl+C quit")
+        Paragraph::new("Tab current/all · j/k move · Enter resume · Ctrl+C quit")
             .style(Style::default().fg(DIM)),
         chunks[2],
     );
@@ -2728,6 +2728,7 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
                 text_panel_height(&text, width)
             }
         }
+        Popup::Update { .. } => 10,
         Popup::TrustDirectory(prompt) => {
             let detail = trust_directory_detail(prompt);
             let option_count = if prompt.saving { 1 } else { 2 };
@@ -2871,6 +2872,23 @@ fn draw_bottom_panel(frame: &mut Frame, state: &AppState, popup: Popup, area: Re
                 frame,
                 "Account",
                 account_text(url.as_deref(), error.as_deref()),
+                area,
+            );
+        }
+        Popup::Update {
+            current,
+            latest,
+            selected,
+        } => {
+            draw_action_panel(
+                frame,
+                "Codex update",
+                &format!(
+                    "Codex {latest} is available. You have {current}.\n\nMagdex will close and run `codex update`."
+                ),
+                &["Update now", "Skip", "Skip this version"],
+                selected,
+                1,
                 area,
             );
         }
@@ -4405,6 +4423,8 @@ mod tests {
         assert!(rendered.contains("Recent conversations · current"));
         assert!(!rendered.contains("Newest conversations"));
         assert!(rendered.contains("Fix transcript width"));
+        assert!(rendered.contains("j/k move"));
+        assert!(!rendered.contains("↑/↓ move"));
         assert!(rendered.contains("Ctrl+C quit"));
         assert!(!rendered.contains("Esc quit"));
         assert!(!rendered.contains("Connecting to app-server"));
@@ -4638,6 +4658,46 @@ mod tests {
         assert!(rendered.contains("project root: /work/project"));
         assert!(rendered.contains("Yes, continue"));
         assert!(rendered.contains("No, quit"));
+    }
+
+    #[test]
+    fn codex_update_prompt_names_versions_and_actions() {
+        let backend = ratatui::backend::TestBackend::new(80, 16);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/work/project".into(), true);
+        state.popup = Some(Popup::Update {
+            current: "0.154.0".into(),
+            latest: "0.155.1".into(),
+            selected: 0,
+        });
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Codex update"));
+        assert!(rendered.contains("Codex 0.155.1 is available. You have 0.154.0."));
+        assert!(rendered.contains("Update now"));
+        assert!(rendered.contains("Skip"));
+        assert!(rendered.contains("Skip this version"));
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(10).contains("Magdex will close"));
+        assert!(row(11).trim().is_empty());
+        assert!(row(12).contains("Update now"));
+        assert!(row(13).contains("Skip"));
+        assert!(row(14).contains("Skip this version"));
+        assert!(row(15).trim().is_empty());
     }
 
     #[test]

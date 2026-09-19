@@ -69,6 +69,8 @@ switches to a stored thread. Its picker starts with the current directory and ca
 show every directory with `Tab`. Authentication is checked on startup and required
 automatically when no Codex account is available. A directory without an existing
 trust decision must be explicitly trusted before Magdex starts or resumes a thread.
+When the official Codex runtime has a newer release, Magdex offers to close and run
+`codex update`; the prompt follows Codex's `check_for_update_on_startup` setting.
 
 Frontend-only settings may be placed in `~/.config/magdex/config.toml`:
 

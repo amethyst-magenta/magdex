@@ -21,6 +21,7 @@ use crate::{
     notification::Notifier,
     rpc::{Incoming, RpcClient},
     ui::markdown_copy_ranges,
+    update::{self, LatestVersion},
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
@@ -108,6 +109,25 @@ pub struct Controller {
     warned_quota_usage: QuotaUsage,
     rate_limits_refresh_needed: bool,
     deferred_turn_events: Vec<DeferredTurnEvent>,
+    update_sender: Option<tokio::sync::mpsc::UnboundedSender<Option<LatestVersion>>>,
+    update_receiver: tokio::sync::mpsc::UnboundedReceiver<Option<LatestVersion>>,
+    update_receiver_closed: bool,
+    codex_version: Option<String>,
+    latest_codex_version: Option<LatestVersion>,
+    startup_ready: bool,
+    update_prompt_shown: bool,
+    update_codex_on_exit: bool,
+}
+
+pub(crate) enum ControllerIncoming {
+    Rpc(Incoming),
+    Update(Option<LatestVersion>),
+}
+
+impl ControllerIncoming {
+    pub(crate) fn is_disconnected(&self) -> bool {
+        matches!(self, Self::Rpc(Incoming::Disconnected(_)))
+    }
 }
 
 impl Controller {
@@ -120,6 +140,7 @@ impl Controller {
         resume_on_start: bool,
     ) -> Result<Self> {
         let rpc = RpcClient::spawn(debug, default_mode_request_user_input).await?;
+        let (update_sender, update_receiver) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(cwd, show_reasoning);
         let mut this = Self {
             state,
@@ -133,6 +154,14 @@ impl Controller {
             warned_quota_usage: QuotaUsage::default(),
             rate_limits_refresh_needed: false,
             deferred_turn_events: Vec::new(),
+            update_sender: Some(update_sender),
+            update_receiver,
+            update_receiver_closed: false,
+            codex_version: None,
+            latest_codex_version: None,
+            startup_ready: false,
+            update_prompt_shown: false,
+            update_codex_on_exit: false,
         };
         this.initialize()?;
         Ok(this)
@@ -154,15 +183,32 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn next_rpc(&mut self) -> Option<Incoming> {
-        self.rpc.incoming.recv().await
+    pub async fn next_rpc(&mut self) -> Option<ControllerIncoming> {
+        loop {
+            tokio::select! {
+                incoming = self.rpc.incoming.recv() => {
+                    return incoming.map(ControllerIncoming::Rpc);
+                }
+                update = self.update_receiver.recv(), if !self.update_receiver_closed => {
+                    match update {
+                        Some(update) => return Some(ControllerIncoming::Update(update)),
+                        None => self.update_receiver_closed = true,
+                    }
+                }
+            }
+        }
     }
 
-    pub fn handle_incoming(&mut self, incoming: Incoming) -> Result<()> {
+    pub fn handle_incoming(&mut self, incoming: ControllerIncoming) -> Result<()> {
         match incoming {
-            Incoming::Message(message) => self.handle_rpc_message(message),
-            Incoming::Disconnected(reason) => {
+            ControllerIncoming::Rpc(Incoming::Message(message)) => self.handle_rpc_message(message),
+            ControllerIncoming::Rpc(Incoming::Disconnected(reason)) => {
                 self.backend_disconnected(reason);
+                Ok(())
+            }
+            ControllerIncoming::Update(update) => {
+                self.latest_codex_version = update;
+                self.maybe_show_update();
                 Ok(())
             }
         }
@@ -264,7 +310,13 @@ impl Controller {
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         match pending {
-            Pending::Initialize => self.after_initialize(),
+            Pending::Initialize => {
+                self.codex_version = result
+                    .get("userAgent")
+                    .and_then(Value::as_str)
+                    .and_then(update::version_from_user_agent);
+                self.after_initialize()
+            }
             Pending::Account => self.apply_account(&result),
             Pending::RateLimits => {
                 self.apply_rate_limits(&result);
@@ -301,6 +353,8 @@ impl Controller {
             Pending::TrustProject { .. } => self.request_config(),
             Pending::StartThread => {
                 self.load_thread_response(&result, false);
+                self.startup_ready = true;
+                self.maybe_show_update();
                 self.quota_warnings_ready = true;
                 self.request_rate_limits()
             }
@@ -430,10 +484,42 @@ impl Controller {
                 scope: ResumeScope::CurrentDirectory,
             });
             self.request_threads_for(ThreadListTarget::Picker, ResumeScope::CurrentDirectory)?;
+            self.startup_ready = true;
+            self.maybe_show_update();
         } else {
             self.start_thread()?;
         }
         Ok(())
+    }
+
+    fn start_update_check(&mut self) {
+        let Some(sender) = self.update_sender.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = sender.send(update::check_latest_version().await);
+        });
+    }
+
+    fn maybe_show_update(&mut self) {
+        if !self.startup_ready || self.update_prompt_shown || self.state.popup.is_some() {
+            return;
+        }
+        let (Some(current), Some(latest)) = (
+            self.codex_version.as_deref(),
+            self.latest_codex_version.as_ref(),
+        ) else {
+            return;
+        };
+        if latest.dismissed || !update::is_newer(&latest.version, current) {
+            return;
+        }
+        self.state.popup = Some(Popup::Update {
+            current: current.to_string(),
+            latest: latest.version.clone(),
+            selected: 0,
+        });
+        self.update_prompt_shown = true;
     }
 
     fn trust_project(&mut self) -> Result<()> {
@@ -556,6 +642,16 @@ impl Controller {
 
     fn apply_config(&mut self, result: &Value) {
         let config = result.get("config").unwrap_or(result);
+        let check_for_update = config
+            .get("checkForUpdateOnStartup")
+            .or_else(|| config.get("check_for_update_on_startup"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if check_for_update {
+            self.start_update_check();
+        } else {
+            self.update_sender = None;
+        }
         if !self.state.explicit_model {
             self.state.model = config
                 .get("model")
@@ -1178,7 +1274,9 @@ impl Controller {
         }
 
         if self.state.popup.is_some() {
-            return self.handle_popup_key(key);
+            self.handle_popup_key(key)?;
+            self.maybe_show_update();
+            return Ok(());
         }
 
         if self.state.resume_picker.is_some() {
@@ -1233,25 +1331,50 @@ impl Controller {
             return self.request_threads_for(ThreadListTarget::Picker, picker.scope.toggled());
         }
         let selected = picker.selected;
-        match key.code {
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(picker) = self.state.resume_picker.as_mut() {
-                    picker.selected = selected.saturating_sub(1);
-                }
+        if let Some(next) = jk_list_selection(key.code, selected, self.state.threads.len()) {
+            if let Some(picker) = self.state.resume_picker.as_mut() {
+                picker.selected = next;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(picker) = self.state.resume_picker.as_mut() {
-                    picker.selected =
-                        (selected + 1).min(self.state.threads.len().saturating_sub(1));
-                }
-            }
-            KeyCode::Enter => return self.resume(selected),
-            _ => {}
+            return Ok(());
+        }
+        if key.code == KeyCode::Enter {
+            return self.resume(selected);
         }
         Ok(())
     }
 
     fn handle_popup_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(Popup::Update {
+            latest, selected, ..
+        }) = self.state.popup.as_mut()
+        {
+            let key = normalize_list_navigation(key);
+            if let Some(next) = jk_list_selection(key.code, *selected, 3) {
+                *selected = next;
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Enter if *selected == 0 => {
+                    self.update_codex_on_exit = true;
+                    self.state.quit = true;
+                }
+                KeyCode::Enter if *selected == 1 => self.state.popup = None,
+                KeyCode::Enter if *selected == 2 => {
+                    let latest = latest.clone();
+                    self.state.popup = None;
+                    if let Err(error) = update::dismiss_version(&latest) {
+                        self.state.push(TranscriptBlock::new(
+                            BlockKind::Error,
+                            "Codex update",
+                            format!("Could not remember skipped version: {error}"),
+                        ));
+                    }
+                }
+                KeyCode::Esc => self.state.popup = None,
+                _ => {}
+            }
+            return Ok(());
+        }
         if let Some(Popup::Disconnected { selected, .. }) = self.state.popup.as_mut() {
             let key = normalize_list_navigation(key);
             match key.code {
@@ -1373,24 +1496,20 @@ impl Controller {
                 selected,
                 loading: false,
                 scope,
-            }) => match key.code {
-                KeyCode::Char('k') | KeyCode::Up => {
+            }) => {
+                if let Some(next) = jk_list_selection(key.code, selected, self.state.threads.len())
+                {
                     self.state.popup = Some(Popup::Resume {
-                        selected: selected.saturating_sub(1),
+                        selected: next,
                         loading: false,
                         scope,
                     });
+                    return Ok(());
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.state.popup = Some(Popup::Resume {
-                        selected: (selected + 1).min(self.state.threads.len().saturating_sub(1)),
-                        loading: false,
-                        scope,
-                    });
+                if key.code == KeyCode::Enter {
+                    return self.resume(selected);
                 }
-                KeyCode::Enter => return self.resume(selected),
-                _ => {}
-            },
+            }
             Some(Popup::History { selected }) => match key.code {
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.state.popup = Some(Popup::History {
@@ -2001,6 +2120,10 @@ impl Controller {
     pub async fn shutdown(self) {
         self.rpc.shutdown().await;
     }
+
+    pub fn update_codex_on_exit(&self) -> bool {
+        self.update_codex_on_exit
+    }
 }
 
 fn defer_turn_event_if_active(
@@ -2302,6 +2425,14 @@ fn normalize_list_navigation(mut key: KeyEvent) -> KeyEvent {
         code => code,
     };
     key
+}
+
+fn jk_list_selection(code: KeyCode, selected: usize, len: usize) -> Option<usize> {
+    match code {
+        KeyCode::Char('k') => Some(selected.saturating_sub(1)),
+        KeyCode::Char('j') => Some((selected + 1).min(len.saturating_sub(1))),
+        _ => None,
+    }
 }
 
 fn normalize_approval_key(key: KeyEvent, editing_feedback: bool) -> KeyEvent {
@@ -4494,6 +4625,14 @@ mod tests {
         assert_eq!(normalize_list_navigation(down).code, KeyCode::Char('j'));
         assert_eq!(normalize_list_navigation(up).code, KeyCode::Char('k'));
         assert_eq!(normalize_list_navigation(text).code, KeyCode::Char('я'));
+    }
+
+    #[test]
+    fn jk_list_selection_ignores_arrow_keys() {
+        assert_eq!(jk_list_selection(KeyCode::Char('k'), 1, 3), Some(0));
+        assert_eq!(jk_list_selection(KeyCode::Char('j'), 1, 3), Some(2));
+        assert_eq!(jk_list_selection(KeyCode::Up, 1, 3), None);
+        assert_eq!(jk_list_selection(KeyCode::Down, 1, 3), None);
     }
 
     #[test]

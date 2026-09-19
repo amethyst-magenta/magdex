@@ -4,6 +4,7 @@ mod model;
 mod notification;
 mod rpc;
 mod ui;
+mod update;
 
 use std::io::{self, IsTerminal, Write};
 
@@ -177,7 +178,7 @@ async fn main() -> Result<()> {
             }
             incoming = controller.next_rpc(), if rpc_open => {
                 if let Some(incoming) = incoming {
-                    let disconnected = matches!(&incoming, rpc::Incoming::Disconnected(_));
+                    let disconnected = incoming.is_disconnected();
                     controller.handle_incoming(incoming)?;
                     if disconnected {
                         rpc_open = false;
@@ -205,8 +206,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    let update_codex = controller.update_codex_on_exit();
     guard.restore()?;
     controller.shutdown().await;
+    if update_codex {
+        update::run_update().await?;
+    }
     Ok(())
 }
 

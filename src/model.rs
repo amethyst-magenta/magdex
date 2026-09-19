@@ -190,6 +190,11 @@ pub enum Popup {
         url: Option<String>,
         error: Option<String>,
     },
+    Update {
+        current: String,
+        latest: String,
+        selected: usize,
+    },
     TrustDirectory(TrustDirectoryPrompt),
     Approval(Approval),
     UserInput(UserInputRequest),
