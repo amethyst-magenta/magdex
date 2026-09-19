@@ -3,7 +3,7 @@ use std::ops::Range;
 use ratatui::style::Stylize;
 use ratatui::{
     buffer::{Buffer, Cell},
-    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
@@ -34,6 +34,7 @@ const COPY_SELECTED_BACKGROUND: Color = Color::Rgb(35, 51, 72);
 const COPY_SELECTED_CURSOR_BACKGROUND: Color = Color::Rgb(47, 72, 91);
 const COLLAPSED_COMMAND_ROWS: usize = 3;
 const HEADER_GROUP_GAP: usize = 4;
+const MAX_EXPANDED_OPTION_LINES: usize = 6;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.visible_hyperlinks.clear();
@@ -280,12 +281,13 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
     let show_project =
         mode_title.width() + project_title.width() + HEADER_GROUP_GAP <= area.width as usize;
     let mut separator = Block::default()
-        .title(Line::styled(mode_title, Style::default().fg(DIM).bold()).left_aligned())
+        .title(Line::styled(mode_title, Style::default().fg(Color::White).bold()).left_aligned())
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::White));
     if show_project {
-        separator = separator
-            .title(Line::styled(project_title, Style::default().fg(DIM).bold()).right_aligned());
+        separator = separator.title(
+            Line::styled(project_title, Style::default().fg(Color::White).bold()).right_aligned(),
+        );
     }
     let separator_area = Rect::new(area.x, area.y.saturating_add(3), area.width, 1);
     frame.render_widget(separator, separator_area);
@@ -2455,17 +2457,13 @@ fn draw_composer(
     } else {
         Style::default().fg(DIM)
     };
-    let block = Block::default()
-        .title(Line::styled(format!(" {shortcut_hint} "), hint_style))
-        .title_alignment(Alignment::Right)
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(if state.copy_mode.is_some() {
+    let block = composer_block(&shortcut_hint, hint_style).border_style(Style::default().fg(
+        if state.copy_mode.is_some() {
             ACCENT
         } else {
             DIM
-        }))
-        .padding(Padding::new(2, 2, 1, 1))
-        .style(Style::default().bg(COMPOSER_BACKGROUND));
+        },
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2583,6 +2581,15 @@ fn draw_composer(
             .saturating_add(layout.cursor_row.saturating_sub(vertical_scroll) as u16);
         frame.set_cursor_position(Position::new(x, y));
     }
+}
+
+fn composer_block(shortcut_hint: &str, hint_style: Style) -> Block<'static> {
+    Block::default()
+        .title(Line::styled(format!(" {shortcut_hint} "), hint_style).right_aligned())
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(DIM))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(Style::default().bg(COMPOSER_BACKGROUND))
 }
 
 fn copy_mode_hint(copy_mode: &CopyMode, width: u16) -> String {
@@ -2744,7 +2751,7 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
                 )
                 .lines
                 .len()
-                .clamp(1, 5) as u16;
+                .clamp(1, 8) as u16;
                 return lines + 4;
             }
             let option_count = approval_options(approval).len();
@@ -2758,12 +2765,27 @@ fn bottom_panel_height(state: &AppState, popup: &Popup, width: u16) -> u16 {
                 return 7;
             };
             let question_lines = visual_line_count(&question.question, width) as u16;
-            let body_lines = if request.is_editing() {
-                3
+            if request.is_editing() {
+                let context_lines = if request.entering_other {
+                    0
+                } else {
+                    question_lines
+                };
+                let input_width = width.saturating_sub(6).max(1) as usize;
+                let input_lines =
+                    layout_composer(&request.input.text, request.input.cursor, input_width)
+                        .lines
+                        .len()
+                        .clamp(1, 8) as u16;
+                (context_lines + input_lines + 4).clamp(5, 18)
             } else {
-                (question.options.len() + usize::from(question.allow_other)) as u16
-            };
-            (question_lines + body_lines + 4).clamp(6, 18)
+                let option_count = question.options.len() + usize::from(question.allow_other);
+                let option_width = width.saturating_sub(6).max(1) as usize;
+                let expanded_height =
+                    user_input_expanded_option_height(question, option_width) as u16;
+                let option_lines = option_count.saturating_sub(1) as u16 + expanded_height;
+                (question_lines + option_lines + 5).clamp(8, 19)
+            }
         }
         Popup::Disconnected { reason, .. } => {
             (visual_line_count(reason, width) as u16 + 6).clamp(7, 14)
@@ -3096,60 +3118,124 @@ fn update_approval_scroll_bounds(approval: &mut crate::model::Approval, area: Re
 }
 
 fn draw_approval_feedback_panel(frame: &mut Frame, approval: &crate::model::Approval, area: Rect) {
-    let block = panel_block("Tell Magdex what to do differently", 1);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let input_width = chunks[0].width.saturating_sub(2).max(1) as usize;
-    let layout = layout_composer(
+    let title = "Tell Magdex what to do differently";
+    draw_prompt_editor(
+        frame,
         &approval.feedback.text,
         approval.feedback.cursor,
-        input_width,
+        "Describe a better approach…",
+        &editor_shortcut_hint("Enter send", "back", editor_hint_width(area.width, title)),
+        Some(title),
+        None,
+        false,
+        area,
     );
-    let visible_lines = chunks[0].height.max(1) as usize;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_prompt_editor(
+    frame: &mut Frame,
+    text: &str,
+    cursor: usize,
+    placeholder: &str,
+    shortcut_hint: &str,
+    title: Option<&str>,
+    context: Option<&str>,
+    secret: bool,
+    area: Rect,
+) {
+    let mut block = composer_block(shortcut_hint, Style::default().fg(DIM));
+    if let Some(title) = title {
+        block = block.title(Line::from(format!(" {title} ")).left_aligned());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let context_height = context
+        .map(|text| visual_line_count(text, area.width) as u16)
+        .unwrap_or(0)
+        .min(inner.height.saturating_sub(1));
+    if let Some(context) = context {
+        frame.render_widget(
+            Paragraph::new(context.to_string()).wrap(Wrap { trim: false }),
+            Rect::new(inner.x, inner.y, inner.width, context_height),
+        );
+    }
+    let input_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(context_height),
+        inner.width,
+        inner.height.saturating_sub(context_height),
+    );
+    if input_area.height == 0 {
+        return;
+    }
+
+    let (display, display_cursor) = if secret {
+        let before_cursor = text[..cursor].chars().count();
+        (
+            "•".repeat(text.chars().count()),
+            before_cursor * '•'.len_utf8(),
+        )
+    } else {
+        (text.to_string(), cursor)
+    };
+    let input_width = input_area.width.saturating_sub(2).max(1) as usize;
+    let layout = layout_composer(&display, display_cursor, input_width);
+    let visible_lines = input_area.height as usize;
     let vertical_scroll = layout
         .cursor_row
         .saturating_add(1)
         .saturating_sub(visible_lines)
         .min(layout.lines.len().saturating_sub(visible_lines));
-    let lines = layout
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            Line::from(vec![
-                Span::styled(
-                    if index == 0 { "› " } else { "  " },
-                    Style::default().fg(ACCENT).bold(),
-                ),
-                if line.is_empty() && approval.feedback.text.is_empty() {
-                    Span::styled("Describe a better approach…", Style::default().fg(DIM))
-                } else {
-                    Span::raw(line.clone())
-                },
-            ])
-        })
-        .collect::<Vec<_>>();
+    let content = if text.is_empty() {
+        Text::from(Line::from(vec![
+            Span::styled("› ", Style::default().fg(ACCENT).bold()),
+            Span::styled(placeholder.to_string(), Style::default().fg(DIM)),
+        ]))
+    } else {
+        Text::from(
+            layout
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    Line::from(vec![
+                        Span::styled(
+                            if index == 0 { "› " } else { "  " },
+                            Style::default().fg(ACCENT).bold(),
+                        ),
+                        Span::raw(line.clone()),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
     frame.render_widget(
-        Paragraph::new(lines).scroll((vertical_scroll as u16, 0)),
-        chunks[0],
+        Paragraph::new(content).scroll((vertical_scroll as u16, 0)),
+        input_area,
     );
-    frame.render_widget(
-        Paragraph::new("Enter send · Shift+Enter newline · Esc back")
-            .style(Style::default().fg(DIM)),
-        chunks[1],
-    );
-    let cursor_x = chunks[0]
+    let cursor_x = input_area
         .x
         .saturating_add(2)
         .saturating_add(layout.cursor_col.min(input_width) as u16);
-    let cursor_y = chunks[0]
+    let cursor_y = input_area
         .y
         .saturating_add(layout.cursor_row.saturating_sub(vertical_scroll) as u16);
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn editor_shortcut_hint(action: &str, escape: &str, width: u16) -> String {
+    match width {
+        60.. => format!("{action} · Shift+Enter newline · Esc {escape}"),
+        42.. => format!("{action} · Shift+Enter newline · Esc"),
+        26.. => format!("{action} · Esc {escape}"),
+        _ => action.to_string(),
+    }
+}
+
+fn editor_hint_width(width: u16, title: &str) -> u16 {
+    width.saturating_sub(title.width() as u16 + 4)
 }
 
 fn approval_body_lines(approval: &crate::model::Approval, width: usize) -> Vec<Line<'static>> {
@@ -3217,115 +3303,149 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
         request.current + 1,
         request.questions.len()
     );
-    let block = panel_block(&title, 1);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let question_height = visual_line_count(&question.question, area.width) as u16;
-
     if request.is_editing() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(question_height),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-        frame.render_widget(
-            Paragraph::new(question.question.clone()).wrap(Wrap { trim: false }),
-            chunks[0],
-        );
-
-        let (display, cursor) = if question.secret {
-            let before_cursor = request.input.text[..request.input.cursor].chars().count();
-            (
-                "•".repeat(request.input.text.chars().count()),
-                before_cursor * '•'.len_utf8(),
-            )
+        let escape = if request.entering_other {
+            "back"
         } else {
-            (request.input.text.clone(), request.input.cursor)
+            "cancel"
         };
-        let input_width = chunks[1].width.saturating_sub(2).max(1) as usize;
-        let layout = layout_composer(&display, cursor, input_width);
-        let visible_lines = chunks[1].height.max(1) as usize;
-        let vertical_scroll = layout
-            .cursor_row
-            .saturating_add(1)
-            .saturating_sub(visible_lines)
-            .min(layout.lines.len().saturating_sub(visible_lines));
-        let lines = layout
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                Line::from(vec![
-                    Span::styled(
-                        if index == 0 { "› " } else { "  " },
-                        Style::default().fg(ACCENT).bold(),
-                    ),
-                    if line.is_empty() && request.input.text.is_empty() {
-                        Span::styled("Type an answer…", Style::default().fg(DIM))
-                    } else {
-                        Span::raw(line.clone())
-                    },
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).scroll((vertical_scroll as u16, 0)),
-            chunks[1],
-        );
-        let cursor_x = chunks[1]
-            .x
-            .saturating_add(2)
-            .saturating_add(layout.cursor_col.min(input_width) as u16);
-        let cursor_y = chunks[1]
-            .y
-            .saturating_add(layout.cursor_row.saturating_sub(vertical_scroll) as u16);
-        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
-        let hint = if request.entering_other {
-            "Enter answer · Shift+Enter newline · Esc back"
-        } else {
-            "Enter answer · Shift+Enter newline · Esc cancel"
-        };
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(DIM)),
-            chunks[2],
+        draw_prompt_editor(
+            frame,
+            &request.input.text,
+            request.input.cursor,
+            "Type an answer…",
+            &editor_shortcut_hint(
+                "Enter answer",
+                escape,
+                editor_hint_width(area.width, &title),
+            ),
+            Some(&title),
+            (!request.entering_other).then_some(question.question.as_str()),
+            question.secret,
+            area,
         );
         return;
     }
 
+    let block = panel_block(&title, 1);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let option_count = question.options.len() + usize::from(question.allow_other);
+    let option_width = inner.width.saturating_sub(2).max(1) as usize;
+    let expanded_height = user_input_expanded_option_height(question, option_width);
+    let option_lines = option_count.saturating_sub(1) + expanded_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(question_height),
-            Constraint::Length(option_count as u16),
+            Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(option_lines as u16),
         ])
         .split(inner);
     frame.render_widget(
         Paragraph::new(question.question.clone()).wrap(Wrap { trim: false }),
         chunks[0],
     );
-    let mut entries = question
-        .options
-        .iter()
-        .map(|option| ListItem::new(format!("{}  {}", option.label, option.description)))
-        .collect::<Vec<_>>();
-    if question.allow_other {
-        entries.push(ListItem::new("Other  Type a custom answer"));
-    }
-    let list = List::new(entries)
-        .highlight_symbol("› ")
-        .highlight_style(Style::default().fg(ACCENT).bold());
-    let mut list_state = ListState::default().with_selected(Some(request.selected));
-    frame.render_stateful_widget(list, chunks[1], &mut list_state);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k choose · Enter answer · Esc cancel")
-            .style(Style::default().fg(DIM)),
+        Paragraph::new("─".repeat(chunks[2].width as usize)).style(Style::default().fg(DIM)),
         chunks[2],
     );
+    let entries = (0..option_count)
+        .map(|index| {
+            let (label, description) = user_input_option_parts(question, index);
+            if index == request.selected {
+                let lines = user_input_expanded_option_lines(label, description, option_width)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(line_index, line)| {
+                        let mut spans = vec![Span::styled(
+                            if line_index == 0 { "› " } else { "  " },
+                            Style::default().fg(ACCENT).bold(),
+                        )];
+                        spans.extend(line.spans);
+                        Line::from(spans)
+                    })
+                    .collect::<Vec<_>>();
+                ListItem::new(lines)
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(truncate(label, option_width), Style::default().bold()),
+                ]))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(entries), chunks[3]);
+}
+
+fn user_input_option_parts(
+    question: &crate::model::UserInputQuestion,
+    index: usize,
+) -> (&str, &str) {
+    question
+        .options
+        .get(index)
+        .map(|option| (option.label.as_str(), option.description.as_str()))
+        .unwrap_or(("Other", "Type a custom answer"))
+}
+
+fn user_input_expanded_option_height(
+    question: &crate::model::UserInputQuestion,
+    width: usize,
+) -> usize {
+    let option_count = question.options.len() + usize::from(question.allow_other);
+    (0..option_count)
+        .map(|index| {
+            let (label, description) = user_input_option_parts(question, index);
+            user_input_expanded_option_lines(label, description, width).len()
+        })
+        .max()
+        .unwrap_or(1)
+}
+
+fn user_input_expanded_option_lines(
+    label: &str,
+    description: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = wrap_styled_spans(
+        vec![Span::styled(
+            label.to_string(),
+            Style::default().fg(ACCENT).bold(),
+        )],
+        width,
+    )
+    .into_iter()
+    .map(Line::from)
+    .collect::<Vec<_>>();
+    lines.extend(
+        wrap_styled_spans(
+            vec![Span::styled(
+                description.to_string(),
+                Style::default().fg(DIM),
+            )],
+            width,
+        )
+        .into_iter()
+        .map(Line::from),
+    );
+    if lines.len() > MAX_EXPANDED_OPTION_LINES {
+        lines.truncate(MAX_EXPANDED_OPTION_LINES);
+        let last = lines.last_mut().unwrap();
+        let style = last
+            .spans
+            .first()
+            .map(|span| span.style)
+            .unwrap_or_else(|| Style::default().fg(DIM));
+        let text = last
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        *last = Line::from(Span::styled(truncate(&format!("{text}…"), width), style));
+    }
+    lines
 }
 
 fn draw_action_panel(
@@ -3462,8 +3582,8 @@ mod tests {
         assert!(row(3).find("Default").unwrap() < row(3).find("~/magdex").unwrap());
         let mode_cell = (0..80).find(|x| buffer[(*x, 3)].symbol() == "D").unwrap();
         let project_cell = (0..80).find(|x| buffer[(*x, 3)].symbol() == "~").unwrap();
-        assert_eq!(buffer[(mode_cell, 3)].fg, DIM);
-        assert_eq!(buffer[(project_cell, 3)].fg, DIM);
+        assert_eq!(buffer[(mode_cell, 3)].fg, Color::White);
+        assert_eq!(buffer[(project_cell, 3)].fg, Color::White);
         assert_eq!(buffer[(40, 3)].fg, Color::White);
     }
 
@@ -4475,8 +4595,8 @@ mod tests {
     }
 
     #[test]
-    fn structured_choices_follow_the_question_and_keep_bottom_padding() {
-        let backend = ratatui::backend::TestBackend::new(100, 8);
+    fn structured_choices_match_the_approval_menu_layout() {
+        let backend = ratatui::backend::TestBackend::new(100, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let request = UserInputRequest {
             id: serde_json::json!(1),
@@ -4519,12 +4639,59 @@ mod tests {
                 .collect::<String>()
         };
         assert!(row(2).contains("How should the release be prepared?"));
-        assert!(row(3).contains("Full release"));
-        assert!(row(5).contains("Skip"));
-        assert!(row(6).contains("Enter answer"));
-        assert!(row(7).trim().is_empty());
-        assert_eq!(buffer[(0, 7)].bg, COMPOSER_BACKGROUND);
-        assert_eq!(buffer[(99, 7)].bg, COMPOSER_BACKGROUND);
+        assert!(row(3).trim().is_empty());
+        assert!(row(4).trim().chars().all(|character| character == '─'));
+        assert!(row(5).contains("Full release"));
+        assert!(row(6).contains("Commit and tag"));
+        let description_cell = (0..100).find(|x| buffer[(*x, 6)].symbol() == "C").unwrap();
+        assert_eq!(buffer[(description_cell, 6)].fg, DIM);
+        assert!(row(7).contains("Prepare only"));
+        assert!(!row(7).contains("No tag"));
+        assert!(row(8).contains("Skip"));
+        assert!(!row(8).contains("Do nothing"));
+        assert!(!row(9).contains("Enter answer"));
+        assert!(row(9).trim().is_empty());
+        assert_eq!(buffer[(0, 9)].bg, COMPOSER_BACKGROUND);
+        assert_eq!(buffer[(99, 9)].bg, COMPOSER_BACKGROUND);
+    }
+
+    #[test]
+    fn custom_answer_uses_the_composer_frame_and_border_hint() {
+        let backend = ratatui::backend::TestBackend::new(80, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut request = UserInputRequest {
+            id: serde_json::json!(1),
+            questions: vec![crate::model::UserInputQuestion {
+                id: "release".into(),
+                header: "Release".into(),
+                question: "How should the release be prepared?".into(),
+                options: vec![crate::model::UserInputOption {
+                    label: "Full release".into(),
+                    description: "Commit and tag".into(),
+                }],
+                allow_other: true,
+                secret: false,
+            }],
+            current: 0,
+            answers: vec![],
+            selected: 1,
+            input: Default::default(),
+            entering_other: true,
+        };
+        request.input.insert_str("Prepare a release candidate");
+
+        terminal
+            .draw(|frame| draw_user_input_panel(frame, &request, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).contains("Enter answer · Shift+Enter newline · Esc back"));
+        assert!(!(0..5).any(|y| row(y).contains("How should the release be prepared?")));
+        assert!(row(2).contains("› Prepare a release candidate"));
+        assert!(row(4).trim().chars().all(|character| character == '─'));
+        assert_eq!(buffer[(0, 2)].bg, COMPOSER_BACKGROUND);
+        assert_eq!(buffer[(79, 2)].bg, COMPOSER_BACKGROUND);
     }
 
     #[test]
@@ -4844,11 +5011,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows
             .iter()
-            .any(|row| row.contains("Tell Magdex what to do differently")));
-        assert!(rows
-            .iter()
             .any(|row| row.contains("› Run only the focused test")));
-        assert!(rows.iter().any(|row| row.contains("Enter send")));
+        assert!(rows[0].contains("Tell Magdex what to do differently"));
+        assert!(rows[0].contains("Enter send"));
+        assert!(rows[7].trim().chars().all(|character| character == '─'));
+        assert_eq!(terminal.backend().buffer()[(0, 2)].bg, COMPOSER_BACKGROUND);
+        assert_eq!(terminal.backend().buffer()[(63, 2)].bg, COMPOSER_BACKGROUND);
     }
 
     #[test]

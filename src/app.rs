@@ -1701,13 +1701,11 @@ impl Controller {
 
         let key = normalize_list_navigation(key);
         let option_count = question.options.len() + usize::from(question.allow_other);
+        if let Some(selected) = jk_list_selection(key.code, request.selected, option_count) {
+            request.selected = selected;
+            return Ok(());
+        }
         match key.code {
-            KeyCode::Char('k') | KeyCode::Up => {
-                request.selected = request.selected.saturating_sub(1);
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                request.selected = (request.selected + 1).min(option_count.saturating_sub(1));
-            }
             KeyCode::Enter if request.selected < question.options.len() => {
                 let answer = question.options[request.selected].label.clone();
                 return self.answer_user_input(answer);
