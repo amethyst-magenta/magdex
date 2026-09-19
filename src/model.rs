@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use ratatui::text::Line;
 use serde_json::Value;
@@ -10,6 +10,31 @@ pub struct ModelInfo {
     pub name: String,
     pub efforts: Vec<String>,
     pub default_effort: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub input_tokens: u64,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaWindow {
+    pub used_percent: u64,
+    pub window_minutes: u64,
+    pub resets_at: Option<u64>,
+}
+
+impl QuotaWindow {
+    pub fn remaining_percent(self) -> u64 {
+        100_u64.saturating_sub(self.used_percent.min(100))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuotaUsage {
+    pub five_hour: Option<QuotaWindow>,
+    pub weekly: Option<QuotaWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +54,7 @@ pub enum BlockKind {
     Command,
     File,
     Web,
+    Compaction,
     Error,
     Status,
     TurnEnd,
@@ -476,6 +502,10 @@ pub struct AppState {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub turn_started_at: Option<std::time::Instant>,
+    pub context_usage: Option<ContextUsage>,
+    pub context_compactions: usize,
+    context_compaction_ids: HashSet<String>,
+    pub quota_usage: QuotaUsage,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub collaboration_mode: String,
@@ -538,6 +568,10 @@ impl AppState {
             thread_id: None,
             turn_id: None,
             turn_started_at: None,
+            context_usage: None,
+            context_compactions: 0,
+            context_compaction_ids: HashSet::new(),
+            quota_usage: QuotaUsage::default(),
             model: None,
             effort: None,
             collaboration_mode: "default".into(),
@@ -592,6 +626,20 @@ impl AppState {
             show_reasoning,
             quit: false,
         }
+    }
+
+    pub fn reset_context_stats(&mut self) {
+        self.context_usage = None;
+        self.context_compactions = 0;
+        self.context_compaction_ids.clear();
+    }
+
+    pub fn record_context_compaction(&mut self, id: &str) -> bool {
+        let inserted = self.context_compaction_ids.insert(id.to_string());
+        if inserted {
+            self.context_compactions += 1;
+        }
+        inserted
     }
 
     pub fn remember_message(&mut self, text: impl Into<String>) {

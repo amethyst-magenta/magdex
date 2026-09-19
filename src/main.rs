@@ -79,15 +79,17 @@ async fn main() -> Result<()> {
     let mut full_redraw = false;
     let mut hyperlink_overlay = Vec::new();
     let zellij_redraw_workaround = running_in_zellij();
+    let mut rendered_block_count = controller.state.blocks.len();
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(33));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = redraw.tick(), if dirty => {
                 let was_full_redraw = full_redraw;
+                let previous_max_scroll = controller.state.transcript_max_scroll;
+                let previous_viewport_height = controller.state.transcript_viewport_height;
                 if full_redraw {
                     invalidate_previous_frame(&mut guard.terminal);
-                    full_redraw = false;
                 }
                 let (next_hyperlink_overlay, cleanup) = {
                     let completed = guard
@@ -113,7 +115,14 @@ async fn main() -> Result<()> {
                     )?;
                 }
                 hyperlink_overlay = next_hyperlink_overlay;
-                dirty = false;
+                rendered_block_count = controller.state.blocks.len();
+                let transcript_shifted = previous_max_scroll
+                    != controller.state.transcript_max_scroll
+                    || previous_viewport_height != controller.state.transcript_viewport_height;
+                let followup_full_redraw =
+                    zellij_redraw_workaround && !was_full_redraw && transcript_shifted;
+                full_redraw = followup_full_redraw;
+                dirty = followup_full_redraw;
             }
             _ = wait_for_next_working_frame(controller.state.turn_started_at) => dirty = true,
             event = events.next() => {
@@ -185,6 +194,15 @@ async fn main() -> Result<()> {
         if controller.state.quit {
             break;
         }
+        if state_requests_full_redraw(
+            &controller.state,
+            rendered_block_count,
+            guard.terminal.size()?,
+            zellij_redraw_workaround,
+        ) {
+            full_redraw = true;
+            dirty = true;
+        }
     }
 
     guard.restore()?;
@@ -245,6 +263,21 @@ fn event_requests_full_redraw(event: &Event, zellij_workaround: bool) -> bool {
         Event::Resize(_, _) => true,
         _ => false,
     }
+}
+
+fn state_requests_full_redraw(
+    state: &model::AppState,
+    rendered_block_count: usize,
+    size: ratatui::layout::Size,
+    zellij_workaround: bool,
+) -> bool {
+    if !zellij_workaround {
+        return false;
+    }
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    let viewport_will_change = ui::expected_transcript_viewport_height(state, area)
+        .is_some_and(|height| height as usize != state.transcript_viewport_height);
+    viewport_will_change || state.blocks.len() != rendered_block_count
 }
 
 fn invalidate_previous_frame<B: Backend>(terminal: &mut Terminal<B>) {
@@ -408,9 +441,12 @@ mod tests {
 
     use super::{
         event_requests_full_redraw, invalidate_previous_frame, next_working_redraw,
-        write_terminal_hyperlinks, WORKING_FRAME_MILLIS,
+        state_requests_full_redraw, write_terminal_hyperlinks, WORKING_FRAME_MILLIS,
     };
-    use crate::ui::{TerminalHyperlinkOverlay, TerminalOverlayCell};
+    use crate::{
+        model::{AppState, BlockKind, TranscriptBlock},
+        ui::{self, TerminalHyperlinkOverlay, TerminalOverlayCell},
+    };
 
     #[test]
     fn working_redraw_aligns_with_turn_frames() {
@@ -457,6 +493,47 @@ mod tests {
         });
         assert!(!event_requests_full_redraw(&moved, true));
         assert!(event_requests_full_redraw(&Event::Resize(120, 40), false));
+    }
+
+    #[test]
+    fn zellij_state_changes_request_a_full_redraw() {
+        let size = ratatui::layout::Size::new(40, 20);
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let mut state = AppState::new("/project".into(), true);
+        state.transcript_viewport_height =
+            ui::expected_transcript_viewport_height(&state, area).unwrap() as usize;
+        let rendered_blocks = state.blocks.len();
+
+        assert!(!state_requests_full_redraw(
+            &state,
+            rendered_blocks,
+            size,
+            true
+        ));
+        state
+            .blocks
+            .push(TranscriptBlock::new(BlockKind::Status, "Quota", "warning"));
+        assert!(state_requests_full_redraw(
+            &state,
+            rendered_blocks,
+            size,
+            true
+        ));
+        assert!(!state_requests_full_redraw(
+            &state,
+            rendered_blocks,
+            size,
+            false
+        ));
+
+        let rendered_blocks = state.blocks.len();
+        state.composer.insert_str(&"long composer text ".repeat(12));
+        assert!(state_requests_full_redraw(
+            &state,
+            rendered_blocks,
+            size,
+            true
+        ));
     }
 
     #[test]

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{ensure, Result};
 use arboard::Clipboard;
@@ -9,9 +13,10 @@ use serde_json::{json, Value};
 use crate::{
     model::{
         ActionStatus, AppState, Approval, ApprovalKind, BlockKind, CollaborationModeInfo,
-        CommandAction, CommandActionKind, CopyMode, FileChange, FileChangeKind, ImageAttachment,
-        ModelInfo, Popup, ResumePicker, ResumeScope, ServerPrompt, ThreadSummary, TranscriptBlock,
-        TrustDirectoryPrompt, UserInputOption, UserInputQuestion, UserInputRequest,
+        CommandAction, CommandActionKind, ContextUsage, CopyMode, FileChange, FileChangeKind,
+        ImageAttachment, ModelInfo, Popup, QuotaUsage, QuotaWindow, ResumePicker, ResumeScope,
+        ServerPrompt, ThreadSummary, TranscriptBlock, TrustDirectoryPrompt, UserInputOption,
+        UserInputQuestion, UserInputRequest,
     },
     notification::Notifier,
     rpc::{Incoming, RpcClient},
@@ -20,6 +25,7 @@ use crate::{
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_OUTPUT_TRUNCATED: &str = "\n[… command output truncated by Magdex …]";
+const QUOTA_WARNING_REARM_PERCENT: u64 = 50;
 pub const SLASH_COMMANDS: [(&str, &str); 8] = [
     ("/new", "New conversation"),
     ("/resume", "Resume conversation"),
@@ -35,6 +41,7 @@ pub const SLASH_COMMANDS: [(&str, &str); 8] = [
 enum Pending {
     Initialize,
     Account,
+    RateLimits,
     Login,
     Models,
     CollaborationModes,
@@ -81,6 +88,12 @@ enum ResumeTarget {
     Picker,
 }
 
+#[derive(Debug)]
+enum DeferredTurnEvent {
+    Transcript(TranscriptBlock),
+    QuotaWarning(String),
+}
+
 pub struct Controller {
     pub state: AppState,
     rpc: RpcClient,
@@ -89,6 +102,10 @@ pub struct Controller {
     default_mode_request_user_input: bool,
     debug: bool,
     startup_resume_pending: bool,
+    quota_warnings_ready: bool,
+    warned_quota_usage: QuotaUsage,
+    rate_limits_refresh_needed: bool,
+    deferred_turn_events: Vec<DeferredTurnEvent>,
 }
 
 impl Controller {
@@ -110,6 +127,10 @@ impl Controller {
             default_mode_request_user_input,
             debug,
             startup_resume_pending: resume_on_start,
+            quota_warnings_ready: false,
+            warned_quota_usage: QuotaUsage::default(),
+            rate_limits_refresh_needed: false,
+            deferred_turn_events: Vec::new(),
         };
         this.initialize()?;
         Ok(this)
@@ -149,6 +170,7 @@ impl Controller {
         self.notify_action_required("Codex backend disconnected");
         self.state.turn_id = None;
         self.state.turn_started_at = None;
+        self.flush_deferred_turn_events();
         self.state.popup = Some(Popup::Disconnected {
             reason,
             selected: 0,
@@ -174,6 +196,10 @@ impl Controller {
             return Ok(());
         };
         if let Some(error) = message.get("error") {
+            if matches!(&pending, Pending::RateLimits) {
+                self.rate_limits_refresh_needed = false;
+                return Ok(());
+            }
             let detail = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -190,8 +216,10 @@ impl Controller {
                 }
                 Pending::ResumeThread(ResumeTarget::Popup) | Pending::ThreadTurns { .. } => {
                     self.state.popup = None;
+                    self.quota_warnings_ready = true;
                 }
                 Pending::ResumeThread(ResumeTarget::Picker) => {
+                    self.quota_warnings_ready = true;
                     if let Some(picker) = self.state.resume_picker.as_mut() {
                         picker.loading = false;
                         picker.error = Some(detail);
@@ -200,6 +228,7 @@ impl Controller {
                 Pending::StartTurn => {
                     self.state.turn_id = None;
                     self.state.turn_started_at = None;
+                    self.flush_deferred_turn_events();
                 }
                 Pending::Account => {
                     self.state.popup = Some(Popup::Login {
@@ -235,6 +264,14 @@ impl Controller {
         match pending {
             Pending::Initialize => self.after_initialize(),
             Pending::Account => self.apply_account(&result),
+            Pending::RateLimits => {
+                self.apply_rate_limits(&result);
+                if std::mem::take(&mut self.rate_limits_refresh_needed) {
+                    self.request_rate_limits()
+                } else {
+                    Ok(())
+                }
+            }
             Pending::Login => self.apply_login(&result),
             Pending::Models => {
                 self.apply_models(&result);
@@ -262,7 +299,8 @@ impl Controller {
             Pending::TrustProject { .. } => self.request_config(),
             Pending::StartThread => {
                 self.load_thread_response(&result, false);
-                Ok(())
+                self.quota_warnings_ready = true;
+                self.request_rate_limits()
             }
             Pending::ListThreads { target, scope } => {
                 self.apply_thread_list(&result, target, scope);
@@ -271,6 +309,7 @@ impl Controller {
             Pending::ResumeThread(_) => {
                 self.load_thread_response(&result, true);
                 self.state.clear_blocks();
+                self.state.reset_context_stats();
                 self.state.push(TranscriptBlock::new(
                     BlockKind::Status,
                     "Codex",
@@ -301,6 +340,7 @@ impl Controller {
     }
 
     fn after_authentication(&mut self) -> Result<()> {
+        self.request_rate_limits()?;
         let models = self
             .rpc
             .request("model/list", json!({"includeHidden": false}))?;
@@ -308,6 +348,62 @@ impl Controller {
         let modes = self.rpc.request("collaborationMode/list", json!({}))?;
         self.pending.insert(modes, Pending::CollaborationModes);
         self.request_config()
+    }
+
+    fn request_rate_limits(&mut self) -> Result<()> {
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::RateLimits))
+        {
+            return Ok(());
+        }
+        let id = self.rpc.request("account/rateLimits/read", json!({}))?;
+        self.pending.insert(id, Pending::RateLimits);
+        Ok(())
+    }
+
+    fn apply_rate_limits(&mut self, result: &Value) {
+        let next = quota_usage_from_response(result);
+        self.state.quota_usage = next;
+        if !self.quota_warnings_ready {
+            return;
+        }
+        let warning_snapshot = merge_quota_warning_state(self.warned_quota_usage, next);
+        let warnings =
+            quota_warning_messages(self.warned_quota_usage, warning_snapshot, unix_timestamp());
+        self.warned_quota_usage = warning_snapshot;
+        for warning in warnings {
+            self.publish_or_defer_turn_event(DeferredTurnEvent::QuotaWarning(warning));
+        }
+    }
+
+    fn publish_or_defer_turn_event(&mut self, event: DeferredTurnEvent) {
+        if let Some(event) =
+            defer_turn_event_if_active(&self.state, &mut self.deferred_turn_events, event)
+        {
+            self.publish_turn_event(event);
+        }
+    }
+
+    fn publish_turn_event(&mut self, event: DeferredTurnEvent) {
+        match event {
+            DeferredTurnEvent::Transcript(block) => self.state.push(block),
+            DeferredTurnEvent::QuotaWarning(warning) => {
+                self.state.push(TranscriptBlock::new(
+                    BlockKind::Status,
+                    "Quota",
+                    warning.clone(),
+                ));
+                self.notifier.quota_low(&self.state.project, &warning);
+            }
+        }
+    }
+
+    fn flush_deferred_turn_events(&mut self) {
+        for event in std::mem::take(&mut self.deferred_turn_events) {
+            self.publish_turn_event(event);
+        }
     }
 
     fn request_config(&mut self) -> Result<()> {
@@ -356,6 +452,7 @@ impl Controller {
     }
 
     fn start_thread(&mut self) -> Result<()> {
+        self.quota_warnings_ready = false;
         let mut params = json!({"cwd": self.state.cwd});
         if self.state.explicit_model {
             params["model"] = self
@@ -477,6 +574,7 @@ impl Controller {
         };
         self.state.thread_id = thread.get("id").and_then(Value::as_str).map(str::to_owned);
         self.state.turn_started_at = None;
+        self.state.reset_context_stats();
         self.state.model = result
             .get("model")
             .and_then(Value::as_str)
@@ -516,12 +614,16 @@ impl Controller {
             .into_iter()
             .flatten()
         {
+            let turn_id = turn.get("id").and_then(Value::as_str);
             for item in turn
                 .get("items")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
+                if let Some(block) = context_compaction_block(&mut self.state, item, turn_id) {
+                    self.state.push(block);
+                }
                 if let Some(text) = user_message_text(item) {
                     self.state.remember_message(text);
                 }
@@ -638,6 +740,7 @@ impl Controller {
             "thread/resume",
             thread_resume_params(&thread.id, &self.state.cwd),
         )?;
+        self.quota_warnings_ready = false;
         let (target, scope) = if let Some(picker) = self.state.resume_picker.as_ref() {
             (ResumeTarget::Picker, picker.scope)
         } else {
@@ -701,12 +804,16 @@ impl Controller {
             .into_iter()
             .flatten()
         {
+            let turn_id = turn.get("id").and_then(Value::as_str);
             for item in turn
                 .get("items")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
+                if let Some(block) = context_compaction_block(&mut self.state, item, turn_id) {
+                    self.state.push(block);
+                }
                 if let Some(text) = user_message_text(item) {
                     self.state.remember_message(text);
                 }
@@ -731,6 +838,8 @@ impl Controller {
             self.state.scroll = usize::MAX;
             self.state.at_bottom = true;
             self.state.popup = None;
+            self.quota_warnings_ready = true;
+            self.request_rate_limits()?;
         }
         Ok(())
     }
@@ -1581,10 +1690,19 @@ impl Controller {
                 if let Some(duration_ms) = duration_ms {
                     self.state.push(turn_end_block(duration_ms));
                 }
+                self.flush_deferred_turn_events();
             }
             "item/started" | "item/completed" => {
                 if let Some(item) = params.get("item") {
                     let completed = method == "item/completed";
+                    if completed {
+                        let turn_id = params.get("turnId").and_then(Value::as_str);
+                        if let Some(block) =
+                            context_compaction_block(&mut self.state, item, turn_id)
+                        {
+                            self.publish_or_defer_turn_event(DeferredTurnEvent::Transcript(block));
+                        }
+                    }
                     if let Some(block) = block_from_item(item, completed, self.state.show_reasoning)
                     {
                         if block.kind == BlockKind::User {
@@ -1613,6 +1731,28 @@ impl Controller {
                 append_delta(&mut self.state, &params, BlockKind::Command, "$ command")
             }
             "item/fileChange/patchUpdated" => update_file_change_patch(&mut self.state, &params),
+            "thread/tokenUsage/updated" => {
+                let matches_thread = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .zip(self.state.thread_id.as_deref())
+                    .is_none_or(|(event, current)| event == current);
+                if matches_thread {
+                    self.state.context_usage = context_usage(&params);
+                }
+            }
+            "thread/compacted" => {
+                let matches_thread = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .zip(self.state.thread_id.as_deref())
+                    .is_some_and(|(event, current)| event == current);
+                if matches_thread {
+                    if let Some(block) = legacy_context_compaction_block(&mut self.state, &params) {
+                        self.publish_or_defer_turn_event(DeferredTurnEvent::Transcript(block));
+                    }
+                }
+            }
             "thread/settings/updated" => {
                 if let Some(mode) = params
                     .pointer("/threadSettings/collaborationMode/mode")
@@ -1661,6 +1801,17 @@ impl Controller {
                                 .to_string(),
                         ),
                     });
+                }
+            }
+            "account/rateLimits/updated" => {
+                if self
+                    .pending
+                    .values()
+                    .any(|pending| matches!(pending, Pending::RateLimits))
+                {
+                    self.rate_limits_refresh_needed = true;
+                } else {
+                    self.request_rate_limits()?;
                 }
             }
             "serverRequest/resolved" => {
@@ -1723,6 +1874,19 @@ impl Controller {
 
     pub async fn shutdown(self) {
         self.rpc.shutdown().await;
+    }
+}
+
+fn defer_turn_event_if_active(
+    state: &AppState,
+    deferred: &mut Vec<DeferredTurnEvent>,
+    event: DeferredTurnEvent,
+) -> Option<DeferredTurnEvent> {
+    if state.turn_id.is_some() || state.turn_started_at.is_some() {
+        deferred.push(event);
+        None
+    } else {
+        Some(event)
     }
 }
 
@@ -2721,6 +2885,182 @@ fn turn_end_block(duration_ms: u64) -> TranscriptBlock {
     TranscriptBlock::new(BlockKind::TurnEnd, "", format_duration(duration_ms))
 }
 
+fn context_usage(params: &Value) -> Option<ContextUsage> {
+    Some(ContextUsage {
+        input_tokens: params.pointer("/tokenUsage/last/inputTokens")?.as_u64()?,
+        context_window: params
+            .pointer("/tokenUsage/modelContextWindow")
+            .and_then(Value::as_u64),
+    })
+}
+
+fn quota_usage_from_response(result: &Value) -> QuotaUsage {
+    let snapshot = result
+        .pointer("/rateLimitsByLimitId/codex")
+        .or_else(|| result.get("rateLimits"));
+    let mut usage = QuotaUsage::default();
+    for window in snapshot
+        .into_iter()
+        .flat_map(|snapshot| [snapshot.get("primary"), snapshot.get("secondary")])
+        .flatten()
+    {
+        let Some(window) = quota_window(window) else {
+            continue;
+        };
+        match window.window_minutes {
+            300 => usage.five_hour = Some(window),
+            10_080 => usage.weekly = Some(window),
+            _ => {}
+        }
+    }
+    usage
+}
+
+fn quota_window(value: &Value) -> Option<QuotaWindow> {
+    Some(QuotaWindow {
+        used_percent: value.get("usedPercent")?.as_u64()?.min(100),
+        window_minutes: value.get("windowDurationMins")?.as_u64()?,
+        resets_at: value.get("resetsAt").and_then(Value::as_u64),
+    })
+}
+
+fn merge_quota_warning_state(previous: QuotaUsage, next: QuotaUsage) -> QuotaUsage {
+    QuotaUsage {
+        five_hour: merge_quota_warning_window(previous.five_hour, next.five_hour),
+        weekly: merge_quota_warning_window(previous.weekly, next.weekly),
+    }
+}
+
+fn merge_quota_warning_window(
+    previous: Option<QuotaWindow>,
+    next: Option<QuotaWindow>,
+) -> Option<QuotaWindow> {
+    match (previous, next) {
+        (Some(previous), Some(mut next)) => {
+            next.resets_at = next.resets_at.or(previous.resets_at);
+            let previous_level = quota_warning_level(previous.remaining_percent());
+            let next_level = quota_warning_level(next.remaining_percent());
+            if previous_level > next_level && next.remaining_percent() < QUOTA_WARNING_REARM_PERCENT
+            {
+                next.used_percent = previous.used_percent;
+            }
+            Some(next)
+        }
+        (previous, None) => previous,
+        (_, next) => next,
+    }
+}
+
+fn quota_warning_messages(previous: QuotaUsage, next: QuotaUsage, now: u64) -> Vec<String> {
+    [
+        ("5-hour", previous.five_hour, next.five_hour),
+        ("weekly", previous.weekly, next.weekly),
+    ]
+    .into_iter()
+    .filter_map(|(label, previous, next)| {
+        let next = next?;
+        let level = quota_warning_level(next.remaining_percent());
+        let previous_level = previous
+            .map(|previous| quota_warning_level(previous.remaining_percent()))
+            .unwrap_or(0);
+        (level > previous_level).then(|| quota_warning_message(label, next, level, now))
+    })
+    .collect()
+}
+
+fn quota_warning_level(remaining_percent: u64) -> u8 {
+    match remaining_percent {
+        0 => 3,
+        1..=10 => 2,
+        11..=20 => 1,
+        _ => 0,
+    }
+}
+
+fn quota_warning_message(label: &str, window: QuotaWindow, level: u8, now: u64) -> String {
+    let severity = match level {
+        3 => "exhausted",
+        2 => "critical",
+        _ => "low",
+    };
+    let reset = window
+        .resets_at
+        .map(|resets_at| format!(" · {}", format_quota_reset(resets_at, now)))
+        .unwrap_or_default();
+    format!(
+        "Quota {severity}: {label} limit has {}% left{reset}",
+        window.remaining_percent()
+    )
+}
+
+fn format_quota_reset(resets_at: u64, now: u64) -> String {
+    let remaining = resets_at.saturating_sub(now);
+    if remaining == 0 {
+        return "resets soon".into();
+    }
+    let minutes = remaining.div_ceil(60);
+    if minutes < 60 {
+        format!("resets in {minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("resets in {}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!(
+            "resets in {}d {}h",
+            minutes / (24 * 60),
+            minutes % (24 * 60) / 60
+        )
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn context_compaction_block(
+    state: &mut AppState,
+    item: &Value,
+    turn_id: Option<&str>,
+) -> Option<TranscriptBlock> {
+    (item.get("type").and_then(Value::as_str) == Some("contextCompaction")).then_some(())?;
+    let id = item.get("id").and_then(Value::as_str)?;
+    let dedupe_id = turn_id
+        .map(|turn_id| format!("turn:{turn_id}"))
+        .unwrap_or_else(|| format!("item:{id}"));
+    context_compaction_block_with_id(state, &dedupe_id, id)
+}
+
+fn legacy_context_compaction_block(
+    state: &mut AppState,
+    params: &Value,
+) -> Option<TranscriptBlock> {
+    let turn_id = params.get("turnId").and_then(Value::as_str)?;
+    let dedupe_id = format!("turn:{turn_id}");
+    let block_id = format!("context-compaction:{turn_id}");
+    context_compaction_block_with_id(state, &dedupe_id, &block_id)
+}
+
+fn context_compaction_block_with_id(
+    state: &mut AppState,
+    dedupe_id: &str,
+    block_id: &str,
+) -> Option<TranscriptBlock> {
+    state.record_context_compaction(dedupe_id).then_some(())?;
+
+    let mut block = TranscriptBlock::new(
+        BlockKind::Compaction,
+        "Context compacted",
+        format!(
+            "Earlier conversation was summarized to free context · {} total",
+            state.context_compactions
+        ),
+    );
+    block.id = Some(block_id.to_string());
+    Some(block)
+}
+
 pub(crate) fn format_duration(duration_ms: u64) -> String {
     let total_seconds = duration_ms / 1_000;
     let hours = total_seconds / 3_600;
@@ -3378,6 +3718,241 @@ mod tests {
             turn_duration_ms(&json!({"durationMs": 48_982})),
             Some(48_982)
         );
+    }
+
+    #[test]
+    fn parses_active_context_usage() {
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 24_763,
+                    "cachedInputTokens": 24_448,
+                    "cacheWriteInputTokens": 12,
+                    "outputTokens": 122,
+                    "reasoningOutputTokens": 64,
+                    "totalTokens": 24_885
+                },
+                "total": {
+                    "inputTokens": 100_000,
+                    "cachedInputTokens": 80_000,
+                    "outputTokens": 4_000,
+                    "reasoningOutputTokens": 2_000,
+                    "totalTokens": 104_000
+                },
+                "modelContextWindow": 400_000
+            }
+        });
+
+        let usage = context_usage(&params).unwrap();
+        assert_eq!(usage.input_tokens, 24_763);
+        assert_eq!(usage.context_window, Some(400_000));
+    }
+
+    #[test]
+    fn parses_five_hour_and_weekly_quota_windows() {
+        let result = json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 19,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_789_767_849_u64
+                },
+                "secondary": {
+                    "usedPercent": 74,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_790_090_321_u64
+                }
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "usedPercent": 19,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_789_767_849_u64
+                    },
+                    "secondary": {
+                        "usedPercent": 74,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 1_790_090_321_u64
+                    }
+                }
+            }
+        });
+
+        let usage = quota_usage_from_response(&result);
+
+        assert_eq!(usage.five_hour.unwrap().remaining_percent(), 81);
+        assert_eq!(usage.weekly.unwrap().remaining_percent(), 26);
+    }
+
+    #[test]
+    fn quota_warnings_fire_only_when_crossing_low_thresholds() {
+        let window = |used_percent| QuotaWindow {
+            used_percent,
+            window_minutes: 300,
+            resets_at: Some(10_000),
+        };
+        let usage = |used_percent| QuotaUsage {
+            five_hour: Some(window(used_percent)),
+            weekly: None,
+        };
+
+        let low = quota_warning_messages(usage(79), usage(80), 1_000);
+        let repeated = quota_warning_messages(usage(80), usage(81), 1_000);
+        let critical = quota_warning_messages(usage(89), usage(90), 1_000);
+        let exhausted = quota_warning_messages(usage(99), usage(100), 1_000);
+
+        assert_eq!(low.len(), 1);
+        assert!(low[0].contains("Quota low: 5-hour limit has 20% left"));
+        assert!(repeated.is_empty());
+        assert!(critical[0].contains("Quota critical"));
+        assert!(exhausted[0].contains("Quota exhausted"));
+    }
+
+    #[test]
+    fn quota_warnings_survive_sparse_snapshots_without_repeating() {
+        let previous = QuotaUsage {
+            five_hour: Some(QuotaWindow {
+                used_percent: 80,
+                window_minutes: 300,
+                resets_at: Some(10_000),
+            }),
+            weekly: None,
+        };
+        let missing_reset = QuotaUsage {
+            five_hour: Some(QuotaWindow {
+                used_percent: 81,
+                window_minutes: 300,
+                resets_at: None,
+            }),
+            weekly: None,
+        };
+
+        let merged = merge_quota_warning_state(previous, missing_reset);
+        assert_eq!(merged.five_hour.unwrap().resets_at, Some(10_000));
+        assert!(quota_warning_messages(previous, merged, 1_000).is_empty());
+        assert_eq!(
+            merge_quota_warning_state(previous, QuotaUsage::default()),
+            previous
+        );
+
+        let moved_reset = QuotaUsage {
+            five_hour: Some(QuotaWindow {
+                used_percent: 82,
+                window_minutes: 300,
+                resets_at: Some(20_000),
+            }),
+            weekly: None,
+        };
+        assert!(quota_warning_messages(previous, moved_reset, 1_000).is_empty());
+
+        let threshold_jitter = QuotaUsage {
+            five_hour: Some(QuotaWindow {
+                used_percent: 79,
+                window_minutes: 300,
+                resets_at: Some(20_000),
+            }),
+            weekly: None,
+        };
+        let still_warned = merge_quota_warning_state(previous, threshold_jitter);
+        assert_eq!(still_warned.five_hour.unwrap().remaining_percent(), 20);
+        let low_again = QuotaUsage {
+            five_hour: Some(QuotaWindow {
+                used_percent: 81,
+                window_minutes: 300,
+                resets_at: Some(20_000),
+            }),
+            weekly: None,
+        };
+        assert!(quota_warning_messages(still_warned, low_again, 1_000).is_empty());
+
+        let recovered = merge_quota_warning_state(
+            still_warned,
+            QuotaUsage {
+                five_hour: Some(QuotaWindow {
+                    used_percent: 50,
+                    window_minutes: 300,
+                    resets_at: Some(30_000),
+                }),
+                weekly: None,
+            },
+        );
+        assert_eq!(recovered.five_hour.unwrap().remaining_percent(), 50);
+        assert_eq!(quota_warning_messages(recovered, low_again, 1_000).len(), 1);
+    }
+
+    #[test]
+    fn quota_reset_time_is_human_readable() {
+        assert_eq!(format_quota_reset(1_060, 1_000), "resets in 1m");
+        assert_eq!(format_quota_reset(8_260, 1_000), "resets in 2h 1m");
+        assert_eq!(format_quota_reset(181_000, 1_000), "resets in 2d 2h");
+        assert_eq!(format_quota_reset(999, 1_000), "resets soon");
+    }
+
+    #[test]
+    fn service_events_wait_until_the_active_turn_finishes() {
+        let mut state = AppState::new("/tmp/project".into(), true);
+        let mut deferred = Vec::new();
+        let immediate = defer_turn_event_if_active(
+            &state,
+            &mut deferred,
+            DeferredTurnEvent::QuotaWarning("low".into()),
+        );
+        assert!(matches!(
+            immediate,
+            Some(DeferredTurnEvent::QuotaWarning(_))
+        ));
+        assert!(deferred.is_empty());
+
+        state.turn_id = Some("turn-1".into());
+        let immediate = defer_turn_event_if_active(
+            &state,
+            &mut deferred,
+            DeferredTurnEvent::Transcript(TranscriptBlock::new(
+                BlockKind::Compaction,
+                "Context compacted",
+                "summary",
+            )),
+        );
+        assert!(immediate.is_none());
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(deferred[0], DeferredTurnEvent::Transcript(_)));
+    }
+
+    #[test]
+    fn creates_one_block_for_each_context_compaction_turn() {
+        let mut state = AppState::new("/tmp/project".into(), true);
+        let item = json!({"id": "compact-1", "type": "contextCompaction"});
+
+        let block = context_compaction_block(&mut state, &item, Some("turn-1")).unwrap();
+        let duplicate = legacy_context_compaction_block(
+            &mut state,
+            &json!({"threadId": "thread-1", "turnId": "turn-1"}),
+        );
+        let unrelated = context_compaction_block(
+            &mut state,
+            &json!({"id": "message-1", "type": "agentMessage"}),
+            Some("turn-1"),
+        );
+
+        assert_eq!(state.context_compactions, 1);
+        assert_eq!(block.kind, BlockKind::Compaction);
+        assert_eq!(block.id.as_deref(), Some("compact-1"));
+        assert!(block.text.contains("1 total"));
+        assert!(duplicate.is_none());
+        assert!(unrelated.is_none());
+
+        let mut legacy_first = AppState::new("/tmp/project".into(), true);
+        assert!(legacy_context_compaction_block(
+            &mut legacy_first,
+            &json!({"threadId": "thread-1", "turnId": "turn-1"}),
+        )
+        .is_some());
+        assert!(context_compaction_block(&mut legacy_first, &item, Some("turn-1")).is_none());
+        assert_eq!(legacy_first.context_compactions, 1);
     }
 
     #[test]

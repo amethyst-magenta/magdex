@@ -15,9 +15,10 @@ use crate::{
     app::{format_duration, relative_time, SLASH_COMMANDS},
     model::{
         display_path, layout_composer, ActionStatus, AppState, ApprovalKind, BlockKind,
-        CommandAction, CommandActionKind, ComposerLayout, CopyMode, FileChange, FileChangeKind,
-        ImageAttachment, Popup, ResumeScope, ThreadSummary, TranscriptBlock, TranscriptHyperlink,
-        TrustDirectoryPrompt, UserInputRequest, VisibleHyperlink,
+        CommandAction, CommandActionKind, ComposerLayout, ContextUsage, CopyMode, FileChange,
+        FileChangeKind, ImageAttachment, Popup, QuotaUsage, ResumeScope, ThreadSummary,
+        TranscriptBlock, TranscriptHyperlink, TrustDirectoryPrompt, UserInputRequest,
+        VisibleHyperlink,
     },
 };
 
@@ -32,6 +33,7 @@ const COPY_CURSOR_BACKGROUND: Color = Color::Rgb(38, 67, 70);
 const COPY_SELECTED_BACKGROUND: Color = Color::Rgb(35, 51, 72);
 const COPY_SELECTED_CURSOR_BACKGROUND: Color = Color::Rgb(47, 72, 91);
 const COLLAPSED_COMMAND_ROWS: usize = 3;
+const HEADER_GROUP_GAP: usize = 4;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.visible_hyperlinks.clear();
@@ -81,6 +83,32 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     } else {
         draw_composer(frame, state, &composer, &slash_suggestions, chunks[3]);
     }
+}
+
+pub(crate) fn expected_transcript_viewport_height(state: &AppState, area: Rect) -> Option<u16> {
+    if state.resume_picker.is_some() {
+        return None;
+    }
+    let composer_width = area.width.saturating_sub(6).max(1) as usize;
+    let composer = layout_composer(&state.composer.text, state.composer.cursor, composer_width);
+    let composer_lines = composer.lines.len().clamp(1, 8) as u16;
+    let attachment_rows = attachment_row_count(state.image_attachments.len());
+    let suggestion_rows = slash_command_suggestions(&state.composer.text).len() as u16;
+    let composer_height = (composer_lines + attachment_rows + suggestion_rows + 4)
+        .min(area.height.saturating_sub(4).max(5));
+    let panel_gap = u16::from(state.popup.is_some() && area.height > 4);
+    let bottom_height = state
+        .popup
+        .as_ref()
+        .map(|popup| bottom_panel_height(state, popup, area.width))
+        .unwrap_or(composer_height)
+        .min(area.height.saturating_sub(5 + panel_gap).max(1));
+    Some(
+        area.height
+            .saturating_sub(4)
+            .saturating_sub(panel_gap)
+            .saturating_sub(bottom_height),
+    )
 }
 
 fn draw_resume_workspace(frame: &mut Frame, state: &AppState) {
@@ -180,29 +208,135 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
-    let right = [
+    let metadata = [
         state.model.as_deref().unwrap_or("default"),
         state.effort.as_deref().unwrap_or("default"),
-        &state.collaboration_mode,
     ]
     .join(" · ");
-    let width = area.width.saturating_sub(2) as usize;
-    let left_width = state.project.width();
-    let right_width = right.width();
-    let gap = width.saturating_sub(left_width + right_width).max(1);
-    let line = Line::from(vec![
-        Span::styled(format!(" {}", state.project), Style::default().bold()),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(right, Style::default().fg(DIM)),
-    ]);
-    let text_area = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-    frame.render_widget(Paragraph::new(line), text_area);
-    let separator = "▔".repeat(area.width as usize);
-    let sep_area = Rect::new(area.x, area.y.saturating_add(3), area.width, 1);
-    frame.render_widget(
-        Paragraph::new(separator).style(Style::default().fg(DIM)),
-        sep_area,
+    let content_width = area.width.saturating_sub(2) as usize;
+    let quota = header_quota_text(&state.quota_usage);
+    let context_variants = header_context_variants(state.context_usage.as_ref());
+    let context_with_quota = context_variants.iter().find(|context| {
+        metadata.width() + quota.width() + context.width() + HEADER_GROUP_GAP * 2 <= content_width
+    });
+    let quota_fits =
+        !quota.is_empty() && metadata.width() + quota.width() + HEADER_GROUP_GAP <= content_width;
+    let (quota, context) = if !quota.is_empty() {
+        if let Some(context) = context_with_quota {
+            (quota, (*context).clone())
+        } else if quota_fits {
+            (quota, String::new())
+        } else {
+            let context = context_variants
+                .into_iter()
+                .find(|context| {
+                    metadata.width() + context.width() + HEADER_GROUP_GAP <= content_width
+                })
+                .unwrap_or_default();
+            (String::new(), context)
+        }
+    } else {
+        let context = context_variants
+            .into_iter()
+            .find(|context| metadata.width() + context.width() + HEADER_GROUP_GAP <= content_width)
+            .unwrap_or_default();
+        (String::new(), context)
+    };
+    let free = content_width.saturating_sub(metadata.width() + quota.width() + context.width());
+    let mut spans = vec![Span::styled(metadata, Style::default().fg(DIM))];
+    match (quota.is_empty(), context.is_empty()) {
+        (false, false) => {
+            let first_gap = free / 2;
+            spans.push(Span::raw(" ".repeat(first_gap)));
+            spans.push(Span::styled(quota, Style::default().fg(DIM)));
+            spans.push(Span::raw(" ".repeat(free.saturating_sub(first_gap))));
+        }
+        (false, true) => {
+            spans.push(Span::raw(" ".repeat(free)));
+            spans.push(Span::styled(quota, Style::default().fg(DIM)));
+        }
+        (true, false) => spans.push(Span::raw(" ".repeat(free))),
+        (true, true) => {}
+    }
+    if !context.is_empty() {
+        spans.push(Span::styled(context, Style::default().fg(DIM)));
+    }
+    let line = Line::from(spans);
+    let text_area = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
     );
+    frame.render_widget(Paragraph::new(line), text_area);
+
+    let mode_title = format!(" {} ", display_mode(&state.collaboration_mode));
+    let project_title = format!(" {} ", state.project);
+    let show_project =
+        mode_title.width() + project_title.width() + HEADER_GROUP_GAP <= area.width as usize;
+    let mut separator = Block::default()
+        .title(Line::styled(mode_title, Style::default().fg(DIM).bold()).left_aligned())
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::White));
+    if show_project {
+        separator = separator
+            .title(Line::styled(project_title, Style::default().fg(DIM).bold()).right_aligned());
+    }
+    let separator_area = Rect::new(area.x, area.y.saturating_add(3), area.width, 1);
+    frame.render_widget(separator, separator_area);
+}
+
+fn header_context_variants(usage: Option<&ContextUsage>) -> Vec<String> {
+    let Some(usage) = usage else {
+        return Vec::new();
+    };
+    let input = compact_token_count(usage.input_tokens);
+    let percent = usage
+        .context_window
+        .filter(|window| *window > 0)
+        .map(|window| (usage.input_tokens as f64 * 100.0 / window as f64).round() as u64);
+    match percent {
+        Some(percent) => vec![
+            format!("{input} ({percent}%)"),
+            format!("{input} {percent}%"),
+        ],
+        None => vec![input],
+    }
+}
+
+fn header_quota_text(usage: &QuotaUsage) -> String {
+    let five_hour = usage.five_hour.map(|window| window.remaining_percent());
+    let weekly = usage.weekly.map(|window| window.remaining_percent());
+    match (five_hour, weekly) {
+        (Some(five_hour), Some(weekly)) => format!("5h {five_hour}% · week {weekly}%"),
+        (Some(five_hour), None) => format!("5h {five_hour}%"),
+        (None, Some(weekly)) => format!("week {weekly}%"),
+        (None, None) => String::new(),
+    }
+}
+
+fn display_mode(mode: &str) -> String {
+    let mut chars = mode.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
+fn compact_token_count(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => compact_decimal(value as f64 / 1_000.0, "k"),
+        _ => compact_decimal(value as f64 / 1_000_000.0, "m"),
+    }
+}
+
+fn compact_decimal(value: f64, suffix: &str) -> String {
+    let mut value = format!("{value:.1}");
+    if value.ends_with(".0") {
+        value.truncate(value.len() - 2);
+    }
+    format!("{value}{suffix}")
 }
 
 fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
@@ -223,7 +357,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let visual_height = state.transcript_cache_lines.len() + tail.len();
     let max_scroll = visual_height.saturating_sub(area.height as usize);
     state.transcript_max_scroll = max_scroll;
-    if state.scroll == usize::MAX || state.scroll >= max_scroll {
+    if state.at_bottom || state.scroll == usize::MAX || state.scroll >= max_scroll {
         state.scroll = max_scroll;
         state.at_bottom = true;
         state.new_output = false;
@@ -538,6 +672,20 @@ fn append_block_with_copy_mode(
         BlockKind::Command => append_command(lines, block, width, can_expand),
         BlockKind::File => append_file_changes(lines, block, width, render_width, cwd),
         BlockKind::Web => append_web_action(lines, block, width),
+        BlockKind::Compaction => {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", block.title),
+                Style::default().bold(),
+            )));
+            push_wrapped_line(
+                lines,
+                vec![Span::styled(
+                    format!("    {}", block.text),
+                    Style::default().fg(DIM),
+                )],
+                width,
+            );
+        }
         BlockKind::Error => {
             lines.push(Line::from(Span::styled(
                 "  Error",
@@ -3000,13 +3148,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_has_symmetric_vertical_padding_and_omits_context_percent() {
+    fn header_shows_active_context_and_mode_in_separator() {
         let backend = ratatui::backend::TestBackend::new(80, 4);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut state = AppState::new("/home/user/magdex".into(), true);
         state.project = "~/magdex".into();
         state.model = Some("gpt-test".into());
         state.effort = Some("high".into());
+        state.context_usage = Some(ContextUsage {
+            input_tokens: 24_763,
+            context_window: Some(258_400),
+        });
+        state.context_compactions = 2;
 
         terminal
             .draw(|frame| draw_header(frame, &state, frame.area()))
@@ -3015,11 +3168,164 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
         assert!(row(0).trim().is_empty());
-        assert!(row(1).contains("~/magdex"));
-        assert!(row(1).contains("gpt-test · high · default"));
-        assert!(!row(1).contains('%'));
+        assert!(row(1).contains("gpt-test · high"));
+        assert!(!row(1).contains("default"));
+        assert!(row(1).contains("24.8k (10%)"));
+        assert!(!row(1).contains("context"));
+        assert!(!row(1).contains("compactions"));
+        assert!(!row(1).contains('│'));
+        assert!(row(1).trim_end().ends_with("24.8k (10%)"));
+        assert!(!row(1).contains("tokens 2.3m"));
         assert!(row(2).trim().is_empty());
-        assert_eq!(row(3), "▔".repeat(80));
+        assert!(row(3).trim_start().starts_with("Default"));
+        assert!(row(3).trim_end().ends_with("~/magdex"));
+        assert!(row(3).find("Default").unwrap() < row(3).find("~/magdex").unwrap());
+        let mode_cell = (0..80).find(|x| buffer[(*x, 3)].symbol() == "D").unwrap();
+        let project_cell = (0..80).find(|x| buffer[(*x, 3)].symbol() == "~").unwrap();
+        assert_eq!(buffer[(mode_cell, 3)].fg, DIM);
+        assert_eq!(buffer[(project_cell, 3)].fg, DIM);
+        assert_eq!(buffer[(40, 3)].fg, Color::White);
+    }
+
+    #[test]
+    fn header_keeps_essential_metrics_at_narrow_width() {
+        let backend = ratatui::backend::TestBackend::new(41, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/home/user/magdex".into(), true);
+        state.model = Some("gpt-test".into());
+        state.effort = Some("high".into());
+        state.context_usage = Some(ContextUsage {
+            input_tokens: 24_763,
+            context_window: Some(258_400),
+        });
+        state.context_compactions = 2;
+        state.quota_usage = QuotaUsage {
+            five_hour: Some(crate::model::QuotaWindow {
+                used_percent: 19,
+                window_minutes: 300,
+                resets_at: None,
+            }),
+            weekly: Some(crate::model::QuotaWindow {
+                used_percent: 74,
+                window_minutes: 10_080,
+                resets_at: None,
+            }),
+        };
+
+        terminal
+            .draw(|frame| draw_header(frame, &state, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..41).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        let metadata = row.find("gpt-test · high").unwrap();
+        let quota = row.find("5h 81% · week 26%").unwrap();
+        assert!(quota - (metadata + "gpt-test · high".width()) >= HEADER_GROUP_GAP);
+        assert!(!row.contains("24.8k"));
+        assert!(!row.contains("quota"));
+        assert!(!row.contains("context"));
+        assert!(!row.contains("compactions"));
+        assert!(!row.contains('│'));
+    }
+
+    #[test]
+    fn header_context_handles_missing_window_or_usage() {
+        let usage = ContextUsage {
+            input_tokens: 24_763,
+            context_window: None,
+        };
+
+        assert_eq!(header_context_variants(Some(&usage)), vec!["24.8k"]);
+        assert!(header_context_variants(None).is_empty());
+    }
+
+    #[test]
+    fn header_places_remaining_quota_between_metadata_and_context() {
+        let backend = ratatui::backend::TestBackend::new(80, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/home/user/magdex".into(), true);
+        state.model = Some("gpt-test".into());
+        state.effort = Some("high".into());
+        state.context_usage = Some(ContextUsage {
+            input_tokens: 24_763,
+            context_window: Some(258_400),
+        });
+        state.context_compactions = 2;
+        state.quota_usage = QuotaUsage {
+            five_hour: Some(crate::model::QuotaWindow {
+                used_percent: 19,
+                window_minutes: 300,
+                resets_at: None,
+            }),
+            weekly: Some(crate::model::QuotaWindow {
+                used_percent: 74,
+                window_minutes: 10_080,
+                resets_at: None,
+            }),
+        };
+
+        terminal
+            .draw(|frame| draw_header(frame, &state, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..80).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        let metadata = row.find("gpt-test · high").unwrap();
+        let quota = row.find("5h 81% · week 26%").unwrap();
+        let context = row.find("24.8k (10%)").unwrap();
+        assert!(metadata < quota && quota < context);
+        assert!(quota - (metadata + "gpt-test · high".width()) >= HEADER_GROUP_GAP);
+        assert!(context - (quota + "5h 81% · week 26%".width()) >= HEADER_GROUP_GAP);
+        let quota_cell = (0..79)
+            .find(|x| buffer[(*x, 1)].symbol() == "5" && buffer[(*x + 1, 1)].symbol() == "h")
+            .unwrap();
+        assert!(
+            (quota_cell..quota_cell + "5h 81% · week 26%".width() as u16)
+                .all(|x| buffer[(x, 1)].fg == DIM)
+        );
+    }
+
+    #[test]
+    fn header_capitalizes_mode_names() {
+        assert_eq!(display_mode("default"), "Default");
+        assert_eq!(display_mode("plan"), "Plan");
+    }
+
+    #[test]
+    fn header_hides_project_before_separator_titles_touch() {
+        let backend = ratatui::backend::TestBackend::new(20, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/home/user/magdex".into(), true);
+        state.project = "~/long-project".into();
+
+        terminal
+            .draw(|frame| draw_header(frame, &state, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..20).map(|x| buffer[(x, 3)].symbol()).collect::<String>();
+        assert!(row.contains("Default"));
+        assert!(!row.contains("long-project"));
+    }
+
+    #[test]
+    fn context_compaction_renders_as_a_separate_transcript_block() {
+        let block = TranscriptBlock::new(
+            BlockKind::Compaction,
+            "Context compacted",
+            "Earlier conversation was summarized to free context · 2 total",
+        );
+        let mut lines = Vec::new();
+
+        append_block(&mut lines, &block, 80, 80, "/tmp/project", false);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("Context compacted"));
+        assert!(rendered.contains("summarized to free context · 2 total"));
     }
 
     #[test]
@@ -3604,6 +3910,35 @@ mod tests {
             .collect::<String>();
         assert!(state.transcript_max_scroll > u16::MAX as usize);
         assert!(rendered.contains("target"));
+    }
+
+    #[test]
+    fn growing_composer_keeps_transcript_pinned_to_bottom() {
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new("/project".into(), true);
+        state.blocks = vec![TranscriptBlock::new(
+            BlockKind::Assistant,
+            "Codex",
+            (0..30)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )];
+        state.mark_transcript_dirty();
+        state.jump_to_bottom();
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let initial_height = state.transcript_viewport_height;
+        let initial_scroll = state.scroll;
+
+        state.composer.insert_str(&"long composer text ".repeat(12));
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+
+        assert!(state.transcript_viewport_height < initial_height);
+        assert!(state.scroll > initial_scroll);
+        assert_eq!(state.scroll, state.transcript_max_scroll);
+        assert!(state.at_bottom);
     }
 
     #[test]

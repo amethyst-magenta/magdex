@@ -55,6 +55,14 @@ impl Notifier {
         );
     }
 
+    pub fn quota_low(&self, project: &str, detail: &str) {
+        self.send(
+            "Magdex quota warning",
+            notification_body(project, Some(detail)),
+            "dialog-warning",
+        );
+    }
+
     fn send(&self, summary: &'static str, body: String, icon: &'static str) {
         if !self.enabled {
             return;
