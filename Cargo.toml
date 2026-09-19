@@ -1,6 +1,6 @@
 [package]
 name = "magdex"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Magdex, a minimal terminal frontend for the official Codex app-server"
 license = "MIT"
