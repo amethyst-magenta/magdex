@@ -19,7 +19,10 @@ use crossterm::{
     },
     execute, queue,
     style::{Attribute, Colors, Print, ResetColor, SetAttribute, SetColors},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use futures_util::StreamExt;
 use ratatui::{
@@ -92,29 +95,37 @@ async fn main() -> Result<()> {
                 if full_redraw {
                     invalidate_previous_frame(&mut guard.terminal);
                 }
-                let (next_hyperlink_overlay, cleanup) = {
-                    let completed = guard
-                        .terminal
-                        .draw(|frame| ui::draw(frame, &mut controller.state))?;
-                    let next_hyperlink_overlay = ui::terminal_hyperlink_overlay(
-                        completed.buffer,
-                        &controller.state.visible_hyperlinks,
-                    );
-                    let cleanup = if next_hyperlink_overlay != hyperlink_overlay {
-                        ui::terminal_hyperlink_cleanup(completed.buffer, &hyperlink_overlay)
-                    } else {
-                        Vec::new()
-                    };
-                    (next_hyperlink_overlay, cleanup)
-                };
-                let overlay_changed = next_hyperlink_overlay != hyperlink_overlay;
-                if overlay_changed || was_full_redraw {
-                    write_terminal_hyperlinks(
-                        guard.terminal.backend_mut(),
-                        &cleanup,
-                        &next_hyperlink_overlay,
-                    )?;
-                }
+                let next_hyperlink_overlay = synchronized_terminal_update(
+                    &mut guard.terminal,
+                    |terminal| {
+                        let (next_hyperlink_overlay, cleanup) = {
+                            let completed = terminal
+                                .draw(|frame| ui::draw(frame, &mut controller.state))?;
+                            let next_hyperlink_overlay = ui::terminal_hyperlink_overlay(
+                                completed.buffer,
+                                &controller.state.visible_hyperlinks,
+                            );
+                            let cleanup = if next_hyperlink_overlay != hyperlink_overlay {
+                                ui::terminal_hyperlink_cleanup(
+                                    completed.buffer,
+                                    &hyperlink_overlay,
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            (next_hyperlink_overlay, cleanup)
+                        };
+                        let overlay_changed = next_hyperlink_overlay != hyperlink_overlay;
+                        if overlay_changed || was_full_redraw {
+                            write_terminal_hyperlinks(
+                                terminal.backend_mut(),
+                                &cleanup,
+                                &next_hyperlink_overlay,
+                            )?;
+                        }
+                        Ok(next_hyperlink_overlay)
+                    },
+                )?;
                 hyperlink_overlay = next_hyperlink_overlay;
                 rendered_block_count = controller.state.blocks.len();
                 let transcript_shifted = previous_max_scroll
@@ -294,6 +305,21 @@ fn invalidate_previous_frame<B: Backend>(terminal: &mut Terminal<B>) {
         cell.set_skip(true);
     }
     terminal.swap_buffers();
+}
+
+fn synchronized_terminal_update<B, T, F>(terminal: &mut Terminal<B>, update: F) -> Result<T>
+where
+    B: Backend + Write,
+    F: FnOnce(&mut Terminal<B>) -> Result<T>,
+{
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let update_result = update(terminal);
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    match (update_result, end_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(error.into()),
+    }
 }
 
 fn write_terminal_hyperlinks<W: Write>(
