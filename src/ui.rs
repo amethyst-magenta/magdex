@@ -200,6 +200,7 @@ fn draw_resume_picker(frame: &mut Frame, state: &AppState, area: Rect) {
             .collect()
     };
     let list = List::new(entries)
+        .style(Style::default().fg(Color::Gray))
         .highlight_symbol("› ")
         .highlight_style(Style::default().fg(ACCENT).bold());
     let selection = (!picker.loading && picker.error.is_none() && !state.threads.is_empty())
@@ -3050,6 +3051,7 @@ fn draw_list_panel(
         .map(ListItem::new)
         .collect::<Vec<ListItem<'_>>>();
     let list = List::new(entries)
+        .style(Style::default().fg(Color::Gray))
         .highlight_symbol("› ")
         .highlight_style(Style::default().fg(ACCENT).bold());
     let mut list_state = ListState::default().with_selected(Some(selected));
@@ -3109,6 +3111,7 @@ fn draw_approval_panel(frame: &mut Frame, approval: &crate::model::Approval, are
         .map(|option| ListItem::new(option.as_str()))
         .collect::<Vec<_>>();
     let list = List::new(entries)
+        .style(Style::default().fg(Color::Gray))
         .highlight_symbol("› ")
         .highlight_style(Style::default().fg(ACCENT).bold());
     let mut list_state = ListState::default().with_selected(Some(approval.selected));
@@ -3390,7 +3393,10 @@ fn draw_user_input_panel(frame: &mut Frame, request: &UserInputRequest, area: Re
             }
         })
         .collect::<Vec<_>>();
-    frame.render_widget(List::new(entries), chunks[3]);
+    frame.render_widget(
+        List::new(entries).style(Style::default().fg(Color::Gray)),
+        chunks[3],
+    );
 }
 
 fn user_input_option_parts(
@@ -3487,6 +3493,7 @@ fn draw_action_panel(
         .map(|option| ListItem::new(*option))
         .collect::<Vec<_>>();
     let list = List::new(entries)
+        .style(Style::default().fg(Color::Gray))
         .highlight_symbol("› ")
         .highlight_style(Style::default().fg(ACCENT).bold());
     let mut list_state = ListState::default().with_selected(Some(selected));
@@ -3560,6 +3567,18 @@ fn resume_entry_text(thread: &ThreadSummary, max_width: usize, scope: ResumeScop
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_position(buffer: &Buffer, needle: &str) -> (u16, u16) {
+        for y in 0..buffer.area.height {
+            let row = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(byte_index) = row.find(needle) {
+                return (row[..byte_index].width() as u16, y);
+            }
+        }
+        panic!("text not found in buffer: {needle}");
+    }
 
     #[test]
     fn header_shows_active_context_and_mode_in_separator() {
@@ -4559,12 +4578,20 @@ mod tests {
             error: None,
             scope: ResumeScope::CurrentDirectory,
         });
-        state.threads = vec![crate::model::ThreadSummary {
-            id: "thread-1".into(),
-            title: "Fix transcript width".into(),
-            cwd: "/work/magdex".into(),
-            updated_at: 0,
-        }];
+        state.threads = vec![
+            crate::model::ThreadSummary {
+                id: "thread-1".into(),
+                title: "Fix transcript width".into(),
+                cwd: "/work/magdex".into(),
+                updated_at: 0,
+            },
+            crate::model::ThreadSummary {
+                id: "thread-2".into(),
+                title: "Review selector colors".into(),
+                cwd: "/work/magdex".into(),
+                updated_at: 0,
+            },
+        ];
 
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
 
@@ -4584,6 +4611,8 @@ mod tests {
         assert!(!rendered.contains("Esc quit"));
         assert!(!rendered.contains("Connecting to app-server"));
         assert!(!rendered.contains("Ask Codex"));
+        let unselected = text_position(terminal.backend().buffer(), "Review selector colors");
+        assert_eq!(terminal.backend().buffer()[unselected].fg, Color::Gray);
     }
 
     #[test]
@@ -4608,11 +4637,18 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(50, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut state = AppState::new("/project".into(), true);
-        state.models = vec![crate::model::ModelInfo {
-            id: "gpt-test".into(),
-            name: "GPT Test".into(),
-            ..Default::default()
-        }];
+        state.models = vec![
+            crate::model::ModelInfo {
+                id: "gpt-test".into(),
+                name: "GPT Test".into(),
+                ..Default::default()
+            },
+            crate::model::ModelInfo {
+                id: "gpt-second".into(),
+                name: "Second Model".into(),
+                ..Default::default()
+            },
+        ];
 
         terminal
             .draw(|frame| {
@@ -4627,6 +4663,11 @@ mod tests {
         assert_eq!(buffer[(49, 3)].symbol(), " ");
         assert_eq!(buffer[(0, 3)].bg, COMPOSER_BACKGROUND);
         assert_eq!(buffer[(49, 3)].bg, COMPOSER_BACKGROUND);
+        assert_eq!(buffer[text_position(buffer, "GPT Test")].fg, ACCENT);
+        assert_eq!(
+            buffer[text_position(buffer, "Second Model")].fg,
+            Color::Gray
+        );
     }
 
     #[test]
@@ -4682,6 +4723,10 @@ mod tests {
         assert_eq!(buffer[(description_cell, 6)].fg, DIM);
         assert!(row(7).contains("Prepare only"));
         assert!(!row(7).contains("No tag"));
+        assert_eq!(
+            buffer[text_position(buffer, "Prepare only")].fg,
+            Color::Gray
+        );
         assert!(row(8).contains("Skip"));
         assert!(!row(8).contains("Do nothing"));
         assert!(!row(9).contains("Enter answer"));
@@ -4926,6 +4971,8 @@ mod tests {
         assert!(row(14).contains("Do you trust"));
         assert!(row(15).contains("Yes, continue"));
         assert!(row(16).contains("No, quit"));
+        assert_eq!(buffer[text_position(buffer, "Yes, continue")].fg, ACCENT);
+        assert_eq!(buffer[text_position(buffer, "No, quit")].fg, Color::Gray);
         assert!(row(17).trim().is_empty());
         assert_eq!(buffer[(0, 17)].bg, COMPOSER_BACKGROUND);
     }
@@ -4977,6 +5024,11 @@ mod tests {
         assert!(command_row < divider_row);
         assert_eq!(divider_row + 1, options_row);
         assert_eq!(buffer[(2, command_row as u16)].fg, Color::Yellow);
+        assert_eq!(buffer[text_position(buffer, "Allow once")].fg, ACCENT);
+        assert_eq!(
+            buffer[text_position(buffer, "Allow for this session")].fg,
+            Color::Gray
+        );
     }
 
     #[test]
