@@ -1754,17 +1754,11 @@ impl Controller {
                 "Question cancelled.",
             ));
         } else {
-            let count = request.answers.len();
             let response = user_input_response(&request);
+            let summary = user_input_answer_summary(&request);
             self.rpc.respond(request.id, response)?;
-            self.state.push(TranscriptBlock::new(
-                BlockKind::Status,
-                "Question",
-                format!(
-                    "Answered {count} question{}.",
-                    if count == 1 { "" } else { "s" }
-                ),
-            ));
+            self.state
+                .push(TranscriptBlock::new(BlockKind::Status, "Question", summary));
         }
         self.state.show_next_server_prompt();
         Ok(())
@@ -2744,6 +2738,45 @@ fn user_input_response(request: &UserInputRequest) -> Value {
         .map(|(id, answers)| (id.clone(), json!({"answers": answers})))
         .collect::<serde_json::Map<_, _>>();
     json!({"answers": answers})
+}
+
+fn user_input_answer_summary(request: &UserInputRequest) -> String {
+    let show_labels = request.answers.len() > 1;
+    let answers = request
+        .answers
+        .iter()
+        .map(|(id, answers)| {
+            let question = request.questions.iter().find(|question| &question.id == id);
+            let secret = question.is_some_and(|question| question.secret);
+            let answer = if secret {
+                "[hidden]".to_string()
+            } else {
+                answers
+                    .iter()
+                    .map(|answer| {
+                        answer
+                            .strip_prefix("user_note: ")
+                            .unwrap_or(answer)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if show_labels {
+                let label = question
+                    .map(|question| question.header.trim())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(id);
+                format!("{label} — {answer}")
+            } else {
+                answer
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Answered: {answers}")
 }
 
 fn append_delta(state: &mut AppState, params: &Value, kind: BlockKind, title: &str) {
@@ -3964,6 +3997,45 @@ mod tests {
         assert_eq!(
             user_input_response(&request),
             json!({"answers": {"database": {"answers": ["Postgres"]}}})
+        );
+        assert_eq!(user_input_answer_summary(&request), "Answered: Postgres");
+    }
+
+    #[test]
+    fn user_input_summary_shows_notes_and_hides_secrets() {
+        let request = UserInputRequest {
+            id: json!(9),
+            questions: vec![
+                UserInputQuestion {
+                    id: "target".into(),
+                    header: "Target".into(),
+                    question: "Where should this run?".into(),
+                    options: vec![],
+                    allow_other: true,
+                    secret: false,
+                },
+                UserInputQuestion {
+                    id: "token".into(),
+                    header: "Token".into(),
+                    question: "Enter the token".into(),
+                    options: vec![],
+                    allow_other: true,
+                    secret: true,
+                },
+            ],
+            current: 2,
+            answers: vec![
+                ("target".into(), vec!["user_note: staging\nserver".into()]),
+                ("token".into(), vec!["do-not-render".into()]),
+            ],
+            selected: 0,
+            input: Default::default(),
+            entering_other: false,
+        };
+
+        assert_eq!(
+            user_input_answer_summary(&request),
+            "Answered: Target — staging server; Token — [hidden]"
         );
     }
 
