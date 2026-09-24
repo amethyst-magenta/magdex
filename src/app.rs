@@ -116,6 +116,7 @@ pub struct Controller {
     latest_codex_version: Option<LatestVersion>,
     startup_ready: bool,
     update_prompt_shown: bool,
+    quota_reset_shown_in_thread: bool,
     update_codex_on_exit: bool,
 }
 
@@ -161,6 +162,7 @@ impl Controller {
             latest_codex_version: None,
             startup_ready: false,
             update_prompt_shown: false,
+            quota_reset_shown_in_thread: false,
             update_codex_on_exit: false,
         };
         this.initialize()?;
@@ -356,6 +358,7 @@ impl Controller {
                 self.startup_ready = true;
                 self.maybe_show_update();
                 self.quota_warnings_ready = true;
+                self.quota_reset_shown_in_thread = false;
                 self.request_rate_limits()
             }
             Pending::ListThreads { target, scope } => {
@@ -423,6 +426,18 @@ impl Controller {
     fn apply_rate_limits(&mut self, result: &Value) {
         let next = quota_usage_from_response(result);
         self.state.quota_usage = next;
+        match quota_reset_available(result) {
+            true if self.startup_ready && !self.quota_reset_shown_in_thread => {
+                self.state.push(TranscriptBlock::new(
+                    BlockKind::Status,
+                    "Usage limit reset",
+                    "Full reset is available.",
+                ));
+                self.quota_reset_shown_in_thread = true;
+            }
+            false => self.quota_reset_shown_in_thread = false,
+            _ => {}
+        }
         if !self.quota_warnings_ready {
             return;
         }
@@ -939,6 +954,7 @@ impl Controller {
             self.state.at_bottom = true;
             self.state.popup = None;
             self.quota_warnings_ready = true;
+            self.quota_reset_shown_in_thread = false;
             self.request_rate_limits()?;
         }
         Ok(())
@@ -3380,6 +3396,13 @@ fn quota_window(value: &Value) -> Option<QuotaWindow> {
     })
 }
 
+fn quota_reset_available(result: &Value) -> bool {
+    result
+        .pointer("/rateLimitResetCredits/availableCount")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+}
+
 fn merge_quota_warning_state(previous: QuotaUsage, next: QuotaUsage) -> QuotaUsage {
     QuotaUsage {
         five_hour: merge_quota_warning_window(previous.five_hour, next.five_hour),
@@ -4378,6 +4401,16 @@ mod tests {
 
         assert_eq!(usage.five_hour.unwrap().remaining_percent(), 81);
         assert_eq!(usage.weekly.unwrap().remaining_percent(), 26);
+    }
+
+    #[test]
+    fn detects_an_available_quota_reset_credit() {
+        assert!(quota_reset_available(
+            &json!({"rateLimitResetCredits": {"availableCount": 1}})
+        ));
+        assert!(!quota_reset_available(
+            &json!({"rateLimitResetCredits": {"availableCount": 0}})
+        ));
     }
 
     #[test]
