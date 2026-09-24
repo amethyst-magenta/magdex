@@ -125,6 +125,7 @@ impl VisibilityProbe {
     }
 
     async fn is_visible(&self) -> bool {
+        let terminal_focused = self.terminal_focused.load(Ordering::Relaxed);
         let (zellij_visible, niri_visible) = tokio::join!(
             async {
                 match &self.zellij {
@@ -140,19 +141,18 @@ impl VisibilityProbe {
             }
         );
 
-        if matches!(zellij_visible, Some(false)) || matches!(niri_visible, Some(false)) {
-            return false;
-        }
-        let expected_checks_succeeded = self
-            .zellij
-            .as_ref()
-            .is_none_or(|_| zellij_visible.is_some())
-            && self.niri.as_ref().is_none_or(|_| niri_visible.is_some());
-        if expected_checks_succeeded && (zellij_visible.is_some() || niri_visible.is_some()) {
-            return true;
-        }
-        self.terminal_focused.load(Ordering::Relaxed)
+        visibility_from_checks(terminal_focused, zellij_visible, niri_visible)
     }
+}
+
+fn visibility_from_checks(
+    terminal_focused: bool,
+    zellij_visible: Option<bool>,
+    niri_visible: Option<bool>,
+) -> bool {
+    terminal_focused
+        && !matches!(zellij_visible, Some(false))
+        && !matches!(niri_visible, Some(false))
 }
 
 #[derive(Clone, Debug)]
@@ -406,6 +406,12 @@ mod tests {
             ),
             Some(false)
         );
+    }
+
+    #[test]
+    fn lost_terminal_focus_is_not_overridden_by_visible_workspace() {
+        assert!(!visibility_from_checks(false, None, Some(true)));
+        assert!(!visibility_from_checks(false, Some(true), Some(true)));
     }
 
     #[test]
