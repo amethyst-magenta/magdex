@@ -27,7 +27,7 @@ use crate::{
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_OUTPUT_TRUNCATED: &str = "\n[… command output truncated by Magdex …]";
 const QUOTA_WARNING_REARM_PERCENT: u64 = 50;
-pub const SLASH_COMMANDS: [(&str, &str); 8] = [
+pub const SLASH_COMMANDS: [(&str, &str); 9] = [
     ("/new", "New conversation"),
     ("/resume", "Resume conversation"),
     ("/mode", "Change mode"),
@@ -36,6 +36,7 @@ pub const SLASH_COMMANDS: [(&str, &str); 8] = [
     ("/history", "Jump to a message"),
     ("/bottom", "Jump to latest output"),
     ("/copy", "Copy an assistant response"),
+    ("/logout", "Sign out of OpenAI Codex"),
 ];
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ enum Pending {
     StartTurn,
     SteerTurn,
     UpdateMode,
+    Logout,
     Interrupt,
 }
 
@@ -388,6 +390,10 @@ impl Controller {
             }
             Pending::SteerTurn => Ok(()),
             Pending::UpdateMode => Ok(()),
+            Pending::Logout => {
+                self.state.quit = true;
+                Ok(())
+            }
             Pending::Interrupt => Ok(()),
         }
     }
@@ -1122,6 +1128,7 @@ impl Controller {
                 enter_copy_mode(&mut self.state);
                 Ok(())
             }
+            "/logout" => self.logout(),
             _ => {
                 self.state.push(TranscriptBlock::new(
                     BlockKind::Error,
@@ -1141,6 +1148,25 @@ impl Controller {
         self.state.queued_turns.clear();
         self.state.clear_message_history();
         self.start_thread()
+    }
+
+    fn logout(&mut self) -> Result<()> {
+        if turn_in_progress(&self.state) {
+            self.state.push(TranscriptBlock::new(
+                BlockKind::Error,
+                "Logout",
+                "Wait for the current turn to finish first.",
+            ));
+            return Ok(());
+        }
+        let id = self.rpc.request("account/logout", json!({}))?;
+        self.pending.insert(id, Pending::Logout);
+        self.state.push(TranscriptBlock::new(
+            BlockKind::Status,
+            "Logout",
+            "Signing out…",
+        ));
+        Ok(())
     }
 
     fn open_models(&mut self) {

@@ -64,8 +64,9 @@ responses, `Enter` to inspect its Markdown blocks, `Enter` again to toggle any
 number of blocks, and `y` to copy the selected blocks. `Esc` moves back one level.
 
 The textual commands are `/new`, `/resume`, `/mode`, `/model`, `/reasoning`,
-`/history`, `/bottom`, and `/copy`. `/history` lists your messages in the current
-thread; selecting one jumps to it in the transcript.
+`/history`, `/bottom`, `/copy`, and `/logout`. `/history` lists your messages in
+the current thread; selecting one jumps to it in the transcript. `/logout`
+removes the OpenAI Codex session and closes Magdex.
 Typing `/` in the composer shows and filters the available commands.
 `/new` switches to a new thread without deleting the current one; `/resume`
 switches to a stored thread. Its picker starts with the current directory and can
