@@ -3106,16 +3106,21 @@ fn draw_approval_panel(frame: &mut Frame, approval: &crate::model::Approval, are
         Paragraph::new("─".repeat(chunks[1].width as usize)).style(Style::default().fg(DIM)),
         chunks[1],
     );
-    let entries = options
+    let options = options
         .iter()
-        .map(|option| ListItem::new(option.as_str()))
+        .enumerate()
+        .map(|(index, option)| {
+            let selected = index == approval.selected;
+            let prefix = if selected { "› " } else { "  " };
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(format!("{prefix}{option}"), style))
+        })
         .collect::<Vec<_>>();
-    let list = List::new(entries)
-        .style(Style::default().fg(Color::Gray))
-        .highlight_symbol("› ")
-        .highlight_style(Style::default().fg(ACCENT).bold());
-    let mut list_state = ListState::default().with_selected(Some(approval.selected));
-    frame.render_stateful_widget(list, chunks[2], &mut list_state);
+    frame.render_widget(Paragraph::new(options), chunks[2]);
 }
 
 fn update_approval_scroll_bounds(approval: &mut crate::model::Approval, area: Rect) {
@@ -5028,6 +5033,27 @@ mod tests {
         assert_eq!(
             buffer[text_position(buffer, "Allow for this session")].fg,
             Color::Gray
+        );
+        for option in [
+            "Allow once",
+            "Allow for this session",
+            "Deny",
+            "Deny and tell Magdex what to do differently",
+            "Deny and cancel turn",
+        ] {
+            assert!(rows.iter().any(|row| row.contains(option)));
+        }
+
+        let mut approval = approval;
+        approval.selected = 4;
+        terminal
+            .draw(|frame| draw_approval_panel(frame, &approval, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[text_position(buffer, "Allow once")].fg, Color::Gray);
+        assert_eq!(
+            buffer[text_position(buffer, "Deny and cancel turn")].fg,
+            ACCENT
         );
     }
 

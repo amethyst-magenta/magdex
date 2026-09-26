@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
     let mut hyperlink_overlay = Vec::new();
     let zellij_redraw_workaround = running_in_zellij();
     let mut rendered_block_count = controller.state.blocks.len();
+    let mut rendered_popup = controller.state.popup.is_some();
     let mut redraw = tokio::time::interval(std::time::Duration::from_millis(33));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -128,6 +129,7 @@ async fn main() -> Result<()> {
                 )?;
                 hyperlink_overlay = next_hyperlink_overlay;
                 rendered_block_count = controller.state.blocks.len();
+                rendered_popup = controller.state.popup.is_some();
                 let transcript_shifted = previous_max_scroll
                     != controller.state.transcript_max_scroll
                     || previous_viewport_height != controller.state.transcript_viewport_height;
@@ -209,6 +211,7 @@ async fn main() -> Result<()> {
         if state_requests_full_redraw(
             &controller.state,
             rendered_block_count,
+            rendered_popup,
             guard.terminal.size()?,
             zellij_redraw_workaround,
         ) {
@@ -284,16 +287,18 @@ fn event_requests_full_redraw(event: &Event, zellij_workaround: bool) -> bool {
 fn state_requests_full_redraw(
     state: &model::AppState,
     rendered_block_count: usize,
+    rendered_popup: bool,
     size: ratatui::layout::Size,
     zellij_workaround: bool,
 ) -> bool {
+    let popup_visibility_changed = state.popup.is_some() != rendered_popup;
     if !zellij_workaround {
-        return false;
+        return popup_visibility_changed;
     }
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     let viewport_will_change = ui::expected_transcript_viewport_height(state, area)
         .is_some_and(|height| height as usize != state.transcript_viewport_height);
-    viewport_will_change || state.blocks.len() != rendered_block_count
+    popup_visibility_changed || viewport_will_change || state.blocks.len() != rendered_block_count
 }
 
 fn invalidate_previous_frame<B: Backend>(terminal: &mut Terminal<B>) {
@@ -538,6 +543,7 @@ mod tests {
         assert!(!state_requests_full_redraw(
             &state,
             rendered_blocks,
+            false,
             size,
             true
         ));
@@ -547,12 +553,14 @@ mod tests {
         assert!(state_requests_full_redraw(
             &state,
             rendered_blocks,
+            false,
             size,
             true
         ));
         assert!(!state_requests_full_redraw(
             &state,
             rendered_blocks,
+            false,
             size,
             false
         ));
@@ -562,9 +570,24 @@ mod tests {
         assert!(state_requests_full_redraw(
             &state,
             rendered_blocks,
+            false,
             size,
             true
         ));
+    }
+
+    #[test]
+    fn popup_visibility_change_requests_a_full_redraw_in_any_terminal() {
+        let size = ratatui::layout::Size::new(80, 24);
+        let mut state = AppState::new("/project".into(), true);
+        state.popup = Some(crate::model::Popup::Login {
+            url: None,
+            error: None,
+        });
+
+        assert!(state_requests_full_redraw(&state, 0, false, size, false));
+        assert!(state_requests_full_redraw(&state, 0, false, size, true));
+        assert!(!state_requests_full_redraw(&state, 0, true, size, false));
     }
 
     #[test]
