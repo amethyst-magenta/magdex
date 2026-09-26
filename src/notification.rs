@@ -150,9 +150,9 @@ fn visibility_from_checks(
     zellij_visible: Option<bool>,
     niri_visible: Option<bool>,
 ) -> bool {
-    terminal_focused
-        && !matches!(zellij_visible, Some(false))
-        && !matches!(niri_visible, Some(false))
+    let window_visible = niri_visible.unwrap_or(terminal_focused);
+    let pane_visible = zellij_visible.unwrap_or(true);
+    window_visible && pane_visible
 }
 
 #[derive(Clone, Debug)]
@@ -409,9 +409,17 @@ mod tests {
     }
 
     #[test]
-    fn lost_terminal_focus_is_not_overridden_by_visible_workspace() {
-        assert!(!visibility_from_checks(false, None, Some(true)));
-        assert!(!visibility_from_checks(false, Some(true), Some(true)));
+    fn visible_workspace_overrides_multiplexer_pane_focus() {
+        assert!(visibility_from_checks(false, None, Some(true)));
+        assert!(visibility_from_checks(false, Some(true), Some(true)));
+        assert!(!visibility_from_checks(false, Some(false), Some(true)));
+        assert!(!visibility_from_checks(false, Some(true), Some(false)));
+    }
+
+    #[test]
+    fn terminal_focus_is_used_when_window_visibility_is_unknown() {
+        assert!(visibility_from_checks(true, Some(true), None));
+        assert!(!visibility_from_checks(false, Some(true), None));
     }
 
     #[test]

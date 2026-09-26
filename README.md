@@ -89,8 +89,8 @@ notifications = true
 - `default_mode_request_user_input` lets Codex ask structured questions in
   Default mode as well as Plan mode.
 - `notifications` sends desktop notifications through `notify-send` when hidden
-  or unfocused Magdex needs user input or finishes a turn. Magdex also checks
-  Zellij pane/tab state and the active Niri workspace when available.
+  Magdex needs user input or finishes a turn. Magdex checks Zellij pane/tab
+  state and the active Niri workspace; terminal focus is used as a fallback.
 
 Codex model defaults, sandbox policy, approvals, MCP, skills, and web settings
 belong in the normal Codex configuration, not this file.
